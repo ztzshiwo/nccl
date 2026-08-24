@@ -191,7 +191,7 @@ static void inspectorUpdateCommOpInfo(struct inspectorCommInfo *commInfo,
   struct inspectorCompletedRing *ring =
     completedOp->isP2p ? &commInfo->completedP2pRing : &commInfo->completedCollRing;
   inspectorLockWr(&commInfo->guard);
-  inspectorComputeOpBw(commInfo, completedOp);
+  //inspectorComputeOpBw(commInfo, completedOp);
   inspectorRingEnqueue(ring, completedOp);
   if (completedOp->isP2p) {
     commInfo->dump_p2p = inspectorRingNonEmpty(&commInfo->completedP2pRing);

@@ -147,6 +147,9 @@ struct inspectorCompletedOpInfo {
   uint64_t sn;
   size_t msgSizeBytes;
   uint64_t execTimeUsecs;
+  uint64_t min_execTimeUsecs;
+  uint64_t min_channel;
+  uint64_t max_channel;
   inspectorTimingSource_t timingSource;
   double algoBwGbs;
   double busBwGbs;

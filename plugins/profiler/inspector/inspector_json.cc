@@ -29,7 +29,7 @@ static inspectorResult_t inspectorCommInfoHeader(jsonFileOutput* jfo,
   JSON_CHK(jsonKey(jfo, "id")); JSON_CHK(jsonStr(jfo, commInfo->commHashStr));
   const char* commName
     = (commInfo->commName && commInfo->commName[0]) ? commInfo->commName : "unknown";
-  JSON_CHK(jsonKey(jfo, "comm_name")); JSON_CHK(jsonStr(jfo, commName));
+  //JSON_CHK(jsonKey(jfo, "comm_name")); JSON_CHK(jsonStr(jfo, commName));
   JSON_CHK(jsonKey(jfo, "rank")); JSON_CHK(jsonInt(jfo, commInfo->rank));
   JSON_CHK(jsonKey(jfo, "n_ranks")); JSON_CHK(jsonInt(jfo, commInfo->nranks));
   JSON_CHK(jsonKey(jfo, "nnodes")); JSON_CHK(jsonUint64(jfo, commInfo->nnodes));
@@ -93,6 +93,7 @@ static inspectorResult_t inspectorCommInfoMetaHeader(jsonFileOutput* jfo) {
  */
 static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jfo,
                                                               const struct inspectorCompletedOpInfo* op) {
+  /*
   JSON_CHK(jsonKey(jfo, "event_trace_sn"));
   JSON_CHK(jsonStartObject(jfo));
   {
@@ -112,13 +113,15 @@ static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jf
     JSON_CHK(jsonFinishList(jfo));
   }
   JSON_CHK(jsonFinishObject(jfo));
+  */
 
-  JSON_CHK(jsonKey(jfo, "event_trace_ts"));
+  //JSON_CHK(jsonKey(jfo, "event_trace_ts"));
   JSON_CHK(jsonStartObject(jfo));
   {
     JSON_CHK(jsonKey(jfo, "coll_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts));
     JSON_CHK(jsonKey(jfo, "coll_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts));
 
+    /*
     JSON_CHK(jsonKey(jfo, "kernel_events"));
     JSON_CHK(jsonStartList(jfo));
     for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
@@ -130,8 +133,9 @@ static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jf
       JSON_CHK(jsonFinishObject(jfo));
     }
     JSON_CHK(jsonFinishList(jfo));
+    */
   }
-  JSON_CHK(jsonFinishObject(jfo));
+  //JSON_CHK(jsonFinishObject(jfo));
 
   return inspectorSuccess;
 }
@@ -207,20 +211,23 @@ static inline inspectorResult_t inspectorCompletedColl(jsonFileOutput* jfo,
   {
     JSON_CHK(jsonKey(jfo, "coll")); JSON_CHK(jsonStr(jfo, ncclFuncToString(op->func)));
 
-    JSON_CHK(jsonKey(jfo, "coll_sn")); JSON_CHK(jsonUint64(jfo, op->sn));
+    //JSON_CHK(jsonKey(jfo, "coll_sn")); JSON_CHK(jsonUint64(jfo, op->sn));
 
     JSON_CHK(jsonKey(jfo, "coll_msg_size_bytes")); JSON_CHK(jsonUint64(jfo, op->msgSizeBytes));
 
     JSON_CHK(jsonKey(jfo, "coll_exec_time_us")); JSON_CHK(jsonUint64(jfo, op->execTimeUsecs));
 
-    JSON_CHK(jsonKey(jfo, "coll_timing_source")); JSON_CHK(jsonStr(jfo, inspectorTimingSourceToString(op->timingSource)));
+    //JSON_CHK(jsonKey(jfo, "coll_timing_source")); JSON_CHK(jsonStr(jfo, inspectorTimingSourceToString(op->timingSource)));
 
-    JSON_CHK(jsonKey(jfo, "coll_algobw_gbs")); JSON_CHK(jsonDouble(jfo, op->algoBwGbs));
+    //JSON_CHK(jsonKey(jfo, "coll_algobw_gbs")); JSON_CHK(jsonDouble(jfo, op->algoBwGbs));
 
-    JSON_CHK(jsonKey(jfo, "coll_busbw_gbs")); JSON_CHK(jsonDouble(jfo, op->busBwGbs));
+    //JSON_CHK(jsonKey(jfo, "coll_busbw_gbs")); JSON_CHK(jsonDouble(jfo, op->busBwGbs));
 
     if (inspectorIsDumpVerboseEnabled()) {
-      INS_CHK(inspectorCompletedCollVerbose(jfo, op));
+      //INS_CHK(inspectorCompletedCollVerbose(jfo, op));
+      JSON_CHK(jsonKey(jfo, "max_channel")); JSON_CHK(jsonUint64(jfo, op->max_channel));
+      JSON_CHK(jsonKey(jfo, "min_exec_time_us")); JSON_CHK(jsonUint64(jfo, op->min_execTimeUsecs));
+      JSON_CHK(jsonKey(jfo, "min_channel")); JSON_CHK(jsonUint64(jfo, op->min_channel));
     }
   }
   JSON_CHK(jsonFinishObject(jfo));
@@ -310,8 +317,8 @@ static inspectorResult_t inspectorCommInfoDumpColl(jsonFileOutput* jfo,
         JSON_CHK(jsonKey(jfo, "header"));
         inspectorCommInfoHeader(jfo, commInfo);
 
-        JSON_CHK(jsonKey(jfo, "metadata"));
-        inspectorCommInfoMetaHeader(jfo);
+        //JSON_CHK(jsonKey(jfo, "metadata"));
+        //inspectorCommInfoMetaHeader(jfo);
 
         JSON_CHK(jsonKey(jfo, "coll_perf"));
         INS_CHK(inspectorCompletedColl(jfo, &drainedColl[i]));
