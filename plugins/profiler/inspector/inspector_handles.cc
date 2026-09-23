@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: Apache-2.0
+/*************************************************************************
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * See LICENSE.txt for license information.
+ *************************************************************************/
+
 #include "inspector.h"
 #include "inspector_event_pool.h"
 #include <condition_variable>
@@ -9,45 +14,45 @@
 namespace {
 // Low byte: tag bit + 7-bit kind; upper bits: never-reused collective ID.
 // No token is dereferenced, including when the registry no longer contains it.
-constexpr unsigned tokenShift = 8;
+constexpr unsigned TOKEN_SHIFT = 8;
 static_assert(sizeof(uintptr_t) == 8, "Inspector tokens require a 64-bit host");
 static_assert(alignof(inspectorP2pInfo) >= 2 && alignof(inspectorKernelChInfo) >= 2,
               "P2P pointers must not have the collective token tag");
-std::mutex registryMutex;
-std::condition_variable registryChanged;
-std::unordered_map<uintptr_t, std::shared_ptr<inspectorCollInfo>> registry;
-uintptr_t nextId = 0; // deliberately not reset by communicator/global finalize
+std::mutex collHandleRegistryMutex;
+std::condition_variable collHandleRegistryChanged;
+std::unordered_map<uintptr_t, std::shared_ptr<inspectorCollInfo>> collHandleRegistry;
+uintptr_t nextCollHandleId = 0; // deliberately not reset by communicator/global finalize
 
-void releaseObject(inspectorCollInfo* coll) {
+void inspectorReleaseCollObject(inspectorCollInfo* coll) {
   auto* comm = coll->commInfo;
   inspectorPluginCollInfoCleanup(coll);
-  std::lock_guard<std::mutex> lock(registryMutex);
+  std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
   --comm->collHandleObjects;
-  registryChanged.notify_all();
+  collHandleRegistryChanged.notify_all();
 }
 }
 
 bool inspectorIsCollToken(void* handle) { return (uintptr_t(handle) & 1) != 0; }
 unsigned inspectorCollTokenKind(void* handle) { return (uintptr_t(handle) & 255) >> 1; }
 void* inspectorCollToken(const inspectorCollInfo* coll, unsigned kind) {
-  return reinterpret_cast<void*>((coll->handleId << tokenShift) | (uintptr_t(kind) << 1) | 1);
+  return reinterpret_cast<void*>((coll->handleId << TOKEN_SHIFT) | (uintptr_t(kind) << 1) | 1);
 }
 
 std::shared_ptr<inspectorCollInfo> inspectorPublishCollHandle(inspectorCollInfo* coll) {
   // Establish a counted owner before any allocation can fail. Destruction must
-  // occur outside registryMutex: the deleter also updates the communicator count.
+  // occur outside the registry lock: the deleter also updates the communicator count.
   {
-    std::lock_guard<std::mutex> lock(registryMutex);
+    std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
     ++coll->commInfo->collHandleObjects;
   }
   std::shared_ptr<inspectorCollInfo> owner;
   try {
-    owner = std::shared_ptr<inspectorCollInfo>(coll, releaseObject);
-    std::lock_guard<std::mutex> lock(registryMutex);
+    owner = std::shared_ptr<inspectorCollInfo>(coll, inspectorReleaseCollObject);
+    std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
     if (coll->commInfo->collHandlesClosing ||
-        nextId == (std::numeric_limits<uintptr_t>::max() >> tokenShift)) return {};
-    coll->handleId = ++nextId;
-    registry.emplace(coll->handleId, owner);
+        nextCollHandleId == (std::numeric_limits<uintptr_t>::max() >> TOKEN_SHIFT)) return {};
+    coll->handleId = ++nextCollHandleId;
+    collHandleRegistry.emplace(coll->handleId, owner);
   } catch (...) {
     // shared_ptr invokes the deleter itself if allocating its control block fails.
     return {};
@@ -57,20 +62,20 @@ std::shared_ptr<inspectorCollInfo> inspectorPublishCollHandle(inspectorCollInfo*
 
 std::shared_ptr<inspectorCollInfo> inspectorAcquireCollHandle(void* handle) {
   if (!inspectorIsCollToken(handle) || inspectorCollTokenKind(handle) > MAX_CHANNELS) return {};
-  std::lock_guard<std::mutex> lock(registryMutex);
-  auto it = registry.find(uintptr_t(handle) >> tokenShift);
-  if (it == registry.end() || it->second->commInfo->collHandlesClosing) return {};
+  std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
+  auto it = collHandleRegistry.find(uintptr_t(handle) >> TOKEN_SHIFT);
+  if (it == collHandleRegistry.end() || it->second->commInfo->collHandlesClosing) return {};
   return it->second;
 }
 
 void inspectorEraseCollHandle(uintptr_t id) {
   std::shared_ptr<inspectorCollInfo> removed;
   {
-    std::lock_guard<std::mutex> lock(registryMutex);
-    auto it = registry.find(id);
-    if (it != registry.end()) {
+    std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
+    auto it = collHandleRegistry.find(id);
+    if (it != collHandleRegistry.end()) {
       removed = std::move(it->second);
-      registry.erase(it);
+      collHandleRegistry.erase(it);
     }
   }
 }
@@ -87,7 +92,7 @@ void inspectorMaybeReleaseCollHandle(const std::shared_ptr<inspectorCollInfo>& c
 }
 
 void inspectorBeginCloseCollHandles(inspectorCommInfo* comm) {
-  std::lock_guard<std::mutex> lock(registryMutex);
+  std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
   comm->collHandlesClosing = true;
 }
 
@@ -97,20 +102,20 @@ void inspectorCloseCollHandles(inspectorCommInfo* comm) {
   for (;;) {
     std::shared_ptr<inspectorCollInfo> removed;
     {
-      std::lock_guard<std::mutex> lock(registryMutex);
-      auto it = registry.begin();
-      while (it != registry.end() && it->second->commInfo != comm) ++it;
-      if (it == registry.end()) break;
+      std::lock_guard<std::mutex> lock(collHandleRegistryMutex);
+      auto it = collHandleRegistry.begin();
+      while (it != collHandleRegistry.end() && it->second->commInfo != comm) ++it;
+      if (it == collHandleRegistry.end()) break;
       removed = std::move(it->second);
-      registry.erase(it);
+      collHandleRegistry.erase(it);
     }
     inspectorLockWr(&removed->guard);
     removed->retired = true;
     inspectorUnlockRWLock(&removed->guard);
     inspectorUnregisterActiveColl(comm, removed.get());
   }
-  std::unique_lock<std::mutex> lock(registryMutex);
-  registryChanged.wait(lock, [&] { return comm->collHandleObjects == 0; });
+  std::unique_lock<std::mutex> lock(collHandleRegistryMutex);
+  collHandleRegistryChanged.wait(lock, [&] { return comm->collHandleObjects == 0; });
 }
 
 void inspectorMarkCollStarted(inspectorCollInfo* coll) {

@@ -1,3 +1,9 @@
+/*************************************************************************
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * See LICENSE.txt for license information.
+ *************************************************************************/
+
 // CPU-only integration: real Inspector callbacks/scanner, controllable clock,
 // host CUDA declarations. No CUDA/NCCL communication or timing claims.
 #include "../inspector.cc"

@@ -27,9 +27,6 @@ static inspectorResult_t inspectorCommInfoHeader(jsonFileOutput* jfo,
                                                  struct inspectorCommInfo* commInfo) {
   JSON_CHK(jsonStartObject(jfo));
   JSON_CHK(jsonKey(jfo, "id")); JSON_CHK(jsonStr(jfo, commInfo->commHashStr));
-  const char* commName
-    = (commInfo->commName && commInfo->commName[0]) ? commInfo->commName : "unknown";
-  //JSON_CHK(jsonKey(jfo, "comm_name")); JSON_CHK(jsonStr(jfo, commName));
   JSON_CHK(jsonKey(jfo, "rank")); JSON_CHK(jsonInt(jfo, commInfo->rank));
   JSON_CHK(jsonKey(jfo, "n_ranks")); JSON_CHK(jsonInt(jfo, commInfo->nranks));
   JSON_CHK(jsonKey(jfo, "nnodes")); JSON_CHK(jsonUint64(jfo, commInfo->nnodes));
@@ -68,75 +65,6 @@ static inspectorResult_t inspectorCommInfoMetaHeader(jsonFileOutput* jfo) {
     JSON_CHK(jsonKey(jfo, "pid")); JSON_CHK(jsonUint64(jfo, getpid()));
   }
   JSON_CHK(jsonFinishObject(jfo));
-  return inspectorSuccess;
-}
-
-/*
- * Description:
- *
- *   Writes verbose information (event_trace) for a completed
- *   collective operation to the JSON output.
- *
- * Thread Safety:
- *   Not thread-safe (should be called with proper locking).
- *
- * Input:
- *   jsonFileOutput* jfo - JSON output handle.
- *   const struct inspectorCompletedOpInfo* op - completed collective info.
- *
- * Output:
- *   Verbose collective info is written to JSON output.
- *
- * Return:
- *   inspectorResult_t - success or error code.
- *
- */
-static inline inspectorResult_t inspectorCompletedCollVerbose(jsonFileOutput* jfo,
-                                                              const struct inspectorCompletedOpInfo* op) {
-  /*
-  JSON_CHK(jsonKey(jfo, "event_trace_sn"));
-  JSON_CHK(jsonStartObject(jfo));
-  {
-    JSON_CHK(jsonKey(jfo, "coll_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].sn));
-    JSON_CHK(jsonKey(jfo, "coll_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].sn));
-
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].sn));
-      JSON_CHK(jsonKey(jfo, "kernel_record_sn")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].sn));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
-  }
-  JSON_CHK(jsonFinishObject(jfo));
-  */
-
-  //JSON_CHK(jsonKey(jfo, "event_trace_ts"));
-  JSON_CHK(jsonStartObject(jfo));
-  {
-    JSON_CHK(jsonKey(jfo, "coll_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts));
-    JSON_CHK(jsonKey(jfo, "coll_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts));
-
-    /*
-    JSON_CHK(jsonKey(jfo, "kernel_events"));
-    JSON_CHK(jsonStartList(jfo));
-    for (uint32_t ch = 0; ch < op->evtTrk.nChannels; ch++) {
-      JSON_CHK(jsonStartObject(jfo));
-      JSON_CHK(jsonKey(jfo, "channel_id")); JSON_CHK(jsonInt(jfo, ch));
-      JSON_CHK(jsonKey(jfo, "kernel_start_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_START].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_stop_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_STOP].ts));
-      JSON_CHK(jsonKey(jfo, "kernel_record_ts")); JSON_CHK(jsonUint64(jfo, op->evtTrk.kernelCh[ch].evntTrace[NCCL_INSP_EVT_TRK_KERNEL_RECORD].ts));
-      JSON_CHK(jsonFinishObject(jfo));
-    }
-    JSON_CHK(jsonFinishList(jfo));
-    */
-  }
-  //JSON_CHK(jsonFinishObject(jfo));
-
   return inspectorSuccess;
 }
 
@@ -211,7 +139,6 @@ static inline inspectorResult_t inspectorCompletedColl(jsonFileOutput* jfo,
   {
     JSON_CHK(jsonKey(jfo, "coll")); JSON_CHK(jsonStr(jfo, ncclFuncToString(op->func)));
 
-    //JSON_CHK(jsonKey(jfo, "coll_sn")); JSON_CHK(jsonUint64(jfo, op->sn));
 
     JSON_CHK(jsonKey(jfo, "coll_msg_size_bytes")); JSON_CHK(jsonUint64(jfo, op->msgSizeBytes));
 
@@ -219,14 +146,10 @@ static inline inspectorResult_t inspectorCompletedColl(jsonFileOutput* jfo,
 
     JSON_CHK(jsonKey(jfo, "coll_exec_time_us")); JSON_CHK(jsonUint64(jfo, op->execTimeUsecs));
 
-    //JSON_CHK(jsonKey(jfo, "coll_timing_source")); JSON_CHK(jsonStr(jfo, inspectorTimingSourceToString(op->timingSource)));
 
-    //JSON_CHK(jsonKey(jfo, "coll_algobw_gbs")); JSON_CHK(jsonDouble(jfo, op->algoBwGbs));
 
-    //JSON_CHK(jsonKey(jfo, "coll_busbw_gbs")); JSON_CHK(jsonDouble(jfo, op->busBwGbs));
 
     if (inspectorIsDumpVerboseEnabled()) {
-      //INS_CHK(inspectorCompletedCollVerbose(jfo, op));
       JSON_CHK(jsonKey(jfo, "max_channel")); JSON_CHK(jsonUint64(jfo, op->max_channel));
       JSON_CHK(jsonKey(jfo, "min_exec_time_us")); JSON_CHK(jsonUint64(jfo, op->min_execTimeUsecs));
       JSON_CHK(jsonKey(jfo, "min_channel")); JSON_CHK(jsonUint64(jfo, op->min_channel));

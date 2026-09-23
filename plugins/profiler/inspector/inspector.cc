@@ -14,6 +14,7 @@
 #include "inspector_event_pool.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -1013,9 +1014,12 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_COMM_POOL_SIZE", getenv("NCCL_INSPECTOR_COMM_POOL_SIZE"), "256", "Comm pool initial size/stride"},
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
-    {"NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS"), "10", "Collective timeout threshold in seconds; 0 disables"},
-    {"NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS", getenv("NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS"), "1000", "Collective timeout scan interval in milliseconds"},
-    {"NCCL_INSPECTOR_COLL_TIMEOUT_PATH", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_PATH"), "(unset)", "Dedicated directory for timeout-only JSONL"},
+    {"NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS"), "10",
+      "Collective timeout threshold in seconds; 0 disables"},
+    {"NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS", getenv("NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS"), "1000",
+      "Collective timeout scan interval in milliseconds"},
+    {"NCCL_INSPECTOR_COLL_TIMEOUT_PATH", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_PATH"), "(unset)",
+      "Dedicated directory for timeout-only JSONL"},
   };
 
   const int numEnvVars = sizeof(envVars) / sizeof(envVars[0]);
@@ -1365,7 +1369,7 @@ const char* inspectorErrorString(inspectorResult_t result) {
  */
 inspectorResult_t inspectorCommGetHashStr(uint64_t commHash,
                                           char hashStr[NCCL_COMM_HASH_LENGTH]) {
-  snprintf(hashStr, NCCL_COMM_HASH_LENGTH, "0x%lx",
+  snprintf(hashStr, NCCL_COMM_HASH_LENGTH, "0x%" PRIx64,
            commHash);
   return inspectorSuccess;
 }

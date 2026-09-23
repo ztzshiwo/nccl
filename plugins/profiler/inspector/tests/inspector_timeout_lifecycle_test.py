@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Build/run Inspector CPU lifecycle tests; CUDA APIs are not exercised."""
 import argparse
 import json
@@ -23,7 +24,7 @@ def main():
     sources = ['inspector_plugin.cc', 'inspector_handles.cc', 'inspector_event_pool.cc',
                'inspector_ring.cc', 'inspector_json.cc',
                'inspector_prom.cc', 'inspector_cudawrap.cc', 'json.cc']
-    flags = ['-std=c++14', '-O1', '-g', '-Wall', '-Wextra', '-pthread',
+    flags = ['-std=c++14', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
              '-DINSPECTOR_TESTING', '-I'+str(plugin), '-I'+str(plugin/'nccl'),
              '-I'+str(plugin/'tests/cpu_stubs')]
     if args.sanitize:

@@ -7,6 +7,7 @@
 
 #include "json.h"
 #include <assert.h>
+#include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -411,7 +412,7 @@ jsonResult_t jsonUint64(jsonFileOutput* jfo, const uint64_t val) {
   if (res != jsonSuccess) {
     return res;
   }
-  fprintf(jfo->fp, "%lu", val);
+  fprintf(jfo->fp, "%" PRIu64, val);
   return jsonSuccess;
 }
 
