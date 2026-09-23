@@ -100,6 +100,73 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
   Comm pool initial size/stride.
 - `NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING=<0|1>` (default: `1`)
   When enabled (default), only events with GPU-based kernel timing (`kernel_gpu`) are recorded. Events that fall back to CPU-measured timing (`kernel_cpu` or `collective_cpu`) are silently discarded. Set to `0` to restore the previous fallback behaviour and retain all events regardless of timing source.
+- `NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS=<seconds>` (default: `10`)
+  Sets both timeout-stage budgets. The FIFO head times out if no KernelCh starts within this many seconds after it becomes eligible to run. After the first KernelCh starts, the same budget is measured again from the execution start. Set to `0` to disable timeout detection.
+- `NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS=<milliseconds>` (default: `1000`)
+  Sets how often the dump thread scans active collectives for timeout. This is the scan period, not the timeout threshold.
+- `NCCL_INSPECTOR_COLL_TIMEOUT_PATH=<output_dir>` (default: unset)
+  Enables timeout-only JSONL output in a dedicated directory. The file is created lazily as `<hostname>-pid<pid>.log` when the first timeout occurs. Normal completed operations are not written to this file.
+
+### Collective Timeout Output
+
+```bash
+export NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS=10
+export NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS=1000
+export NCCL_INSPECTOR_COLL_TIMEOUT_PATH=/tmp/nccl-inspector-timeouts
+```
+
+The timeout watchdog reuses the Inspector dump thread. It still runs when the normal dump interval is `-1`, but it is disabled when `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. No timeout file is created when no collective times out. Active collectives are tracked in the order Inspector observes them. Only the FIFO head has a queue-wait budget; when it completes, the next not-yet-started collective receives a fresh budget. A collective that has started is checked against an independent execution budget. A queue timeout and an execution timeout can each be emitted at most once, and a timed-out collective that later completes is still written to the normal completed-operation output.
+
+The `metadata.event_type` value classifies the observed timeout state. Consumers that previously matched the exact value `collective_timeout` must instead match the `collective_timeout_` prefix:
+
+| Condition | `metadata.event_type` |
+| --- | --- |
+| `expected > 0 && started == 0 && completed == 0` | `collective_timeout_operation_not_dispatched` |
+| `expected > started && started > completed` | `collective_timeout_gpu_and_communication_issue` |
+| `expected > started` | `collective_timeout_gpu_issue` |
+| `started > completed` | `collective_timeout_communication_issue` |
+| Any other inconsistent combination | `collective_timeout_unknown` |
+
+Each timeout is appended as one JSON object. `timeout_elapsed_ms` is the elapsed time for the stage that triggered the record. `queue_wait_elapsed_ms` measures time from FIFO-head eligibility to the first KernelCh start (or to the queue timeout), while `kernel_execution_elapsed_ms` measures time since the first KernelCh start. A collective that starts before it becomes FIFO head reports `null` for queue wait. `estimated_channel_payload_bytes` is the ceiling of collective message bytes divided by expected channels; it is an Inspector-only equal-partition payload estimate, not an exact NCCL work slice or network wire-byte count. A timeout with no completed channel reports `null` for min/max timing and channel fields:
+
+```json
+{
+  "header": {
+    "id": "0x0000000000001234",
+    "comm_name": "dp-group",
+    "rank": 0,
+    "n_ranks": 8,
+    "nnodes": 1
+  },
+  "metadata": {
+    "event_type": "collective_timeout_operation_not_dispatched",
+    "dump_timestamp_us": 1750000000000000,
+    "hostname": "node-0",
+    "pid": 1234
+  },
+  "coll_timeout": {
+    "coll": "AllReduce",
+    "coll_seq_number": 42,
+    "algo": "RING",
+    "proto": "SIMPLE",
+    "coll_msg_size_bytes": 1048576,
+    "timeout_elapsed_ms": 10000,
+    "queue_wait_elapsed_ms": 10000,
+    "kernel_execution_elapsed_ms": null,
+    "expected_channels": 32,
+    "estimated_channel_payload_bytes": 32768,
+    "started_channels": 0,
+    "completed_channels": 0,
+    "started_channel_mask": 0,
+    "completed_channel_mask": 0,
+    "min_exec_time_us": null,
+    "min_channel": null,
+    "max_exec_time_us": null,
+    "max_channel": null,
+    "timing_source": "unavailable"
+  }
+}
+```
 
 ### Debugging
 
@@ -206,6 +273,7 @@ Each output file contains JSON objects with the following structure:
     "coll": "AllReduce",
     "coll_sn": 1407,
     "coll_msg_size_bytes": 17179869184,
+    "n_channels": 32,
     "coll_exec_time_us": 61974,
     "coll_algobw_gbs": 277.210914,
     "coll_busbw_gbs": 485.119099
@@ -243,6 +311,7 @@ This will include additional event trace information in the JSON output, showing
     "coll": "ReduceScatter",
     "coll_sn": 1231,
     "coll_msg_size_bytes": 2147483648,
+    "n_channels": 24,
     "coll_exec_time_us": 41057,
     "coll_timing_source": "kernel_gpu",
     "coll_algobw_gbs": 418.439467,
@@ -311,4 +380,3 @@ The size of output files depends on the output format and usage patterns:
 
 - The plugin is compatible with standard NCCL workflows and can be used in both single-node and multi-node (SLURM) environments.
 - For more details, see the source code and comments in `plugins/profiler/inspector/`.
-

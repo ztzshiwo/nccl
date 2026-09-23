@@ -23,6 +23,7 @@
 static int gInitialized;
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+static bool invalidKernelChannelWarned = false;
 
 
 /*
@@ -181,7 +182,7 @@ inspectorResult_t inspectorPluginCollInfoDeRef(struct inspectorCollInfo *collInf
   return inspectorSuccess;
 }
 
-static void inspectorPluginCollInfoCleanup(struct inspectorCollInfo *collInfo) {
+void inspectorPluginCollInfoCleanup(struct inspectorCollInfo *collInfo) {
   inspectorLockDestroy(&collInfo->guard);
   inspectorEventPoolReleaseColl(collInfo);
 }
@@ -259,8 +260,14 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
   collInfoPtr->nChannels = eDescr->coll.nChannels;
   if (collInfoPtr->nChannels > 0) {
     inspectorPluginCollInfoRef(collInfoPtr); //extra ref for kernel completion
+    collInfoPtr->kernelCompletionRefHeld = true;
   }
   collInfoPtr->tsStartUsec = inspectorGetTime();
+  collInfoPtr->queueWatchStartUsec = 0;
+  collInfoPtr->executionStartUsec = 0;
+  collInfoPtr->timeoutReportedMask = 0;
+  collInfoPtr->activeRegistered = false;
+  collInfoPtr->activeNext = nullptr;
   collInfoPtr->msgSizeBytes =
     ncclTypeSize(inspectorStringToDatatype(eDescr->coll.datatype)) * eDescr->coll.count;
 
@@ -272,6 +279,10 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
                             NCCL_INSP_EVT_TRK_OP_START, collInfoPtr);
 
   inspectorLockInit(&collInfoPtr->guard);
+  if (inspectorCollTimeoutEnabled() && collInfoPtr->nChannels > 0) {
+    inspectorPluginCollInfoRef(collInfoPtr); // active registry ref
+    inspectorRegisterActiveColl(commInfo, collInfoPtr);
+  }
   *collInfo = collInfoPtr;
 }
 
@@ -366,8 +377,10 @@ static void inspectorPluginKernelChInfoInitColl(struct inspectorKernelChInfo **k
   kernelChInfoPtr->tsStartUsec = inspectorGetTime();
   if (collInfo->nKernelChStarted == 0) {
     collInfo->tsStartUsec = kernelChInfoPtr->tsStartUsec;
+    collInfo->executionStartUsec = inspectorGetMonotonicTimeUsecs();
   }
   collInfo->nKernelChStarted += 1;
+  collInfo->startedChannelMask |= 1ULL << eDescr->kernelCh.channelId;
   inspectorPluginCollInfoRef(collInfo); //Pairs with Stop Kernel Event
 
   *kernelChInfo = kernelChInfoPtr;
@@ -406,6 +419,15 @@ static void inspectorPluginKernelChInfoInitP2p(struct inspectorKernelChInfo **ke
 
 static void inspectorPluginKernelChInfoInit(struct inspectorKernelChInfo **kernelChInfo,
                                             ncclProfilerEventDescr_t *eDescr) {
+  if (eDescr->kernelCh.channelId >= MAX_CHANNELS) {
+    if (!__atomic_exchange_n(&invalidKernelChannelWarned, true, __ATOMIC_RELAXED)) {
+      WARN_INSPECTOR("Inspector: ignoring KernelCh channelId %u; maximum supported channelId is %u",
+                     (unsigned)eDescr->kernelCh.channelId,
+                     (unsigned)(MAX_CHANNELS - 1));
+    }
+    *kernelChInfo = nullptr;
+    return;
+  }
   if (eDescr->parentObj) {
     uint64_t parentType = *(uint64_t*)eDescr->parentObj;
     if (parentType == ncclProfileColl) {
@@ -537,9 +559,10 @@ static ncclResult_t inspectorPluginStopEventP2p(struct inspectorP2pInfo *p2pInfo
 
 static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelChInfo *kernelChInfo,
                                                          struct inspectorCollInfo *collInfo) {
-  struct inspectorCompletedOpInfo completedOp;
+  struct inspectorCompletedOpInfo completedOp = {};
   bool needsCleanup = false;
-  bool doCommUpdate = false;
+  bool collCompleted = false;
+  bool emitCompleted = false;
 
   inspectorLockWr(&collInfo->guard);
   struct inspectorCommInfo *commInfo = collInfo->commInfo;
@@ -550,6 +573,7 @@ static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelC
                             collInfo);
   kernelChInfo->tsCompletedUsec = inspectorGetTime();
   collInfo->nKernelChCompleted += 1;
+  collInfo->completedChannelMask |= 1ULL << kernelChInfo->channelId;
 
   inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
   if (res == inspectorReturn) {
@@ -559,33 +583,33 @@ static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelC
 
   if ((collInfo->nKernelChCompleted == collInfo->nKernelChStarted)
       && (collInfo->nKernelChCompleted == collInfo->nChannels)) {
-
     collInfo->tsCompletedUsec = kernelChInfo->tsCompletedUsec;
+    collCompleted = true;
     inspectorUpdateCollPerf(&completedOp, collInfo);
-
-    // Discard if GPU-based kernel timing is not available and kernel timing is required.
-    if (requireKernelTiming &&
-        completedOp.timingSource != inspectorTimingSourceKernelGpu) {
-      res = inspectorPluginCollInfoDeRef(collInfo);
-      if (res == inspectorReturn) {
-        needsCleanup = true;
-      }
-      goto done;
-    }
+    emitCompleted = !requireKernelTiming ||
+                    completedOp.timingSource == inspectorTimingSourceKernelGpu;
 
     res = inspectorPluginCollInfoDeRef(collInfo);
+    collInfo->kernelCompletionRefHeld = false;
     if (res == inspectorReturn) {
       needsCleanup = true;
     }
-    doCommUpdate = (commInfo != nullptr);
   }
 
 done:
   inspectorUnlockRWLock(&collInfo->guard);
+
+  if (collCompleted && inspectorUnregisterActiveColl(commInfo, collInfo)) {
+    inspectorLockWr(&collInfo->guard);
+    res = inspectorPluginCollInfoDeRef(collInfo); // release active registry ref
+    inspectorUnlockRWLock(&collInfo->guard);
+    if (res == inspectorReturn) needsCleanup = true;
+  }
+
   if (needsCleanup) {
     inspectorPluginCollInfoCleanup(collInfo);
   }
-  if (doCommUpdate) {
+  if (collCompleted && emitCompleted && commInfo) {
     inspectorUpdateCommOpInfo(commInfo, &completedOp);
   }
   return ncclSuccess;
@@ -593,7 +617,7 @@ done:
 
 static ncclResult_t inspectorPluginStopEventKernelChP2p(struct inspectorKernelChInfo *kernelChInfo,
                                                         struct inspectorP2pInfo *p2pInfo) {
-  struct inspectorCompletedOpInfo completedOp;
+  struct inspectorCompletedOpInfo completedOp = {};
   bool needsCleanup = false;
   bool doCommUpdate = false;
 
@@ -670,6 +694,7 @@ static ncclResult_t inspectorPluginRecordEventStateKernelChColl(struct inspector
                             collInfo);
   kernelChInfo->stopGpuClk = eStateArgs->kernelCh.pTimer;
   if (kernelChInfo->startGpuClk != 0) {
+    collInfo->recordRefReleasedChannelMask |= 1ULL << kernelChInfo->channelId;
     inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
     if (res == inspectorReturn) {
       needsCleanup = true;

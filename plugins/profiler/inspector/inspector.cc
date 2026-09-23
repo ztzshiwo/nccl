@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <algorithm>
 #include <cstring>
 #include <chrono>
 #include <thread>
@@ -62,6 +63,14 @@ static bool ncclInspectorInit = false;
 bool enableNcclInspectorP2p = true;
 // Global flag: require kernel-based timing; discard events without it
 bool requireKernelTiming = true;
+static uint64_t ncclInspectorCollTimeoutUsecs = 10ULL * 1000 * 1000;
+static uint64_t ncclInspectorDumpTimeoutIntervalUsecs = 1000ULL * 1000;
+static char* ncclInspectorCollTimeoutPath = nullptr;
+static bool ncclInspectorCollTimeoutOutputEnabled = false;
+
+static inspectorResult_t inspectorCollectTimedOutColls(
+    std::vector<inspectorCollTimeoutInfo>& timeoutRecords);
+
 bool inspectorIsDumpVerboseEnabled() {
   return enableNcclInspectorDumpVerbose;
 }
@@ -102,6 +111,16 @@ uint64_t inspectorGetTime() {
   gettimeofday(&tv, 0);
   ts = tv.tv_sec * 1000000 + tv.tv_usec;
   return ts;
+}
+
+uint64_t inspectorGetMonotonicTimeUsecs() {
+  struct timespec ts = {};
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+bool inspectorCollTimeoutEnabled() {
+  return ncclInspectorCollTimeoutOutputEnabled && ncclInspectorCollTimeoutUsecs > 0;
 }
 
 /*
@@ -275,6 +294,64 @@ inspectorResult_t inspectorUnlockRWLock(pthread_rwlock_t* lockRef) {
   } else {
     return inspectorSuccess;
   }
+}
+
+void inspectorRegisterActiveColl(struct inspectorCommInfo* commInfo,
+                                 struct inspectorCollInfo* collInfo) {
+  if (!commInfo || !collInfo) return;
+  inspectorLockWr(&commInfo->guard);
+  collInfo->activeNext = nullptr;
+  if (commInfo->activeTail) {
+    commInfo->activeTail->activeNext = collInfo;
+    commInfo->activeTail = collInfo;
+  } else {
+    inspectorLockWr(&collInfo->guard);
+    collInfo->queueWatchStartUsec = inspectorGetMonotonicTimeUsecs();
+    inspectorUnlockRWLock(&collInfo->guard);
+    commInfo->activeHead = collInfo;
+    commInfo->activeTail = collInfo;
+  }
+  collInfo->activeRegistered = true;
+  inspectorUnlockRWLock(&commInfo->guard);
+}
+
+bool inspectorUnregisterActiveColl(struct inspectorCommInfo* commInfo,
+                                   struct inspectorCollInfo* collInfo) {
+  if (!commInfo || !collInfo) return false;
+  bool removed = false;
+  inspectorLockWr(&commInfo->guard);
+  struct inspectorCollInfo* prev = nullptr;
+  struct inspectorCollInfo* current = commInfo->activeHead;
+  while (current) {
+    if (current == collInfo) {
+      struct inspectorCollInfo* next = current->activeNext;
+      bool removedHead = prev == nullptr;
+      if (prev) {
+        prev->activeNext = next;
+      } else {
+        commInfo->activeHead = next;
+      }
+      if (commInfo->activeTail == current) {
+        commInfo->activeTail = prev;
+      }
+      collInfo->activeNext = nullptr;
+      collInfo->activeRegistered = false;
+      if (removedHead && next) {
+        inspectorLockWr(&next->guard);
+        if (next->nKernelChStarted == 0 && next->executionStartUsec == 0 &&
+            next->queueWatchStartUsec == 0) {
+          next->queueWatchStartUsec = inspectorGetMonotonicTimeUsecs();
+        }
+        inspectorUnlockRWLock(&next->guard);
+      }
+      removed = true;
+      break;
+    }
+    prev = current;
+    current = current->activeNext;
+  }
+  inspectorUnlockRWLock(&commInfo->guard);
+  return removed;
 }
 
 
@@ -488,9 +565,18 @@ static void genDumpDir(char** workdir) {
 
 
 inspectorDumpThread::inspectorDumpThread(const char* _outputRoot, int64_t _sampleIntervalUsecs)
-  : jfo(nullptr), outputRoot(strdup(_outputRoot)), sampleIntervalUsecs(_sampleIntervalUsecs) {
-  if (inspectorLockInit(&guard) != inspectorSuccess) {
-    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't init lock");
+  : jfo(nullptr), timeoutJfo(nullptr),
+    outputRoot(_outputRoot ? strdup(_outputRoot) : nullptr),
+    timeoutOutputRoot(inspectorCollTimeoutEnabled()
+                        ? strdup(ncclInspectorCollTimeoutPath)
+                        : nullptr),
+    sampleIntervalUsecs(_sampleIntervalUsecs),
+    timeoutCheckIntervalUsecs(ncclInspectorDumpTimeoutIntervalUsecs) {
+  if (pthread_mutex_init(&stateMutex, nullptr) != 0) {
+    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't init state mutex");
+  }
+  if (pthread_cond_init(&stateCond, nullptr) != 0) {
+    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't init state condition");
   }
 }
 
@@ -523,12 +609,23 @@ inspectorDumpThread::~inspectorDumpThread() {
     jsonFinalizeFileOutput(jfo);
     jfo = nullptr;
   }
+  if (timeoutJfo != nullptr) {
+    jsonFinalizeFileOutput(timeoutJfo);
+    timeoutJfo = nullptr;
+  }
   if (outputRoot != nullptr) {
     free(outputRoot);
     outputRoot = nullptr;
   }
-  if (inspectorLockDestroy(&guard) != inspectorSuccess) {
-    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't destroy lock");
+  if (timeoutOutputRoot != nullptr) {
+    free(timeoutOutputRoot);
+    timeoutOutputRoot = nullptr;
+  }
+  if (pthread_cond_destroy(&stateCond) != 0) {
+    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't destroy state condition");
+  }
+  if (pthread_mutex_destroy(&stateMutex) != 0) {
+    INFO_INSPECTOR("NCCL Inspector inspectorDumpThread: couldn't destroy state mutex");
   }
 }
 
@@ -604,12 +701,15 @@ FILE* inspectorDumpThread::getOrCreateFileHandle(const char* deviceUuidStr,
 }
 
 void inspectorDumpThread::startThread() {
-  inspectorLockWr(&guard);
+  pthread_mutex_lock(&stateMutex);
   run = true;
-  inspectorUnlockRWLock(&guard);
+  pthread_mutex_unlock(&stateMutex);
   if (pthread_create(&pthread, NULL, dumpMain, this) != 0) {
     INFO_INSPECTOR(
       "NCCL Inspector inspectorDumpThread: couldn't create dump thread!");
+    pthread_mutex_lock(&stateMutex);
+    run = false;
+    pthread_mutex_unlock(&stateMutex);
     return;
   }
   threadStarted = true;
@@ -618,9 +718,10 @@ void inspectorDumpThread::startThread() {
 
 void inspectorDumpThread::stopThread() {
   INFO(NCCL_ENV, "NCCL Inspector Stopping Dump thread");
-  inspectorLockWr(&guard);
+  pthread_mutex_lock(&stateMutex);
   run = false;
-  inspectorUnlockRWLock(&guard);
+  pthread_cond_broadcast(&stateCond);
+  pthread_mutex_unlock(&stateMutex);
   if (threadStarted) {
     pthread_join(pthread, nullptr);
     threadStarted = false;
@@ -644,6 +745,32 @@ inspectorResult_t inspectorDumpThread::inspectorStateDump(const char* output_roo
   }
 }
 
+inspectorResult_t inspectorDumpThread::inspectorTimeoutDump(
+    const std::vector<inspectorCollTimeoutInfo>& timeoutRecords) {
+  if (timeoutRecords.empty() || timeoutWriterFailed || !timeoutOutputRoot) {
+    return inspectorSuccess;
+  }
+  if (!timeoutJfo) {
+    char hostname[256] = {};
+    gethostname(hostname, sizeof(hostname) - 1);
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/%s-pid%d.log",
+             timeoutOutputRoot, hostname, getpid());
+    jsonResult_t result = jsonInitFileOutput(&timeoutJfo, path);
+    if (result != jsonSuccess) {
+      INFO_INSPECTOR("NCCL Inspector: cannot open timeout file %s: %s",
+                     path, jsonErrorString(result));
+      timeoutWriterFailed = true;
+      timeoutJfo = nullptr;
+      return inspectorFileOpenError;
+    }
+    chmod(path, 0666);
+  }
+  inspectorResult_t result = inspectorCollTimeoutDump(timeoutJfo, timeoutRecords);
+  if (result != inspectorSuccess) timeoutWriterFailed = true;
+  return result;
+}
+
 inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output_root) {
   if (jfo == 0) {
     char hostname[256];
@@ -663,9 +790,7 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output
     inspectorCommInfoListDump(jfo, &g_state.deletedComms);
   }
 
-  if (g_state.deletedComms.ncomms > 0) {
-    inspectorCommInfoListFinalize(&g_state.deletedComms);
-  }
+  inspectorCommInfoListFinalize(&g_state.deletedComms);
   return inspectorSuccess;
 }
 
@@ -683,33 +808,67 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpProm(const char* output
   }
 
   // Finalize deleted communicators
-  if (g_state.deletedComms.ncomms > 0) {
-    inspectorCommInfoListFinalize(&g_state.deletedComms);
-  }
+  inspectorCommInfoListFinalize(&g_state.deletedComms);
 
   return inspectorSuccess;
 }
 
 void* inspectorDumpThread::dumpMain(void* arg) {
   inspectorDumpThread* dumper = (inspectorDumpThread*)arg;
-  inspectorResult_t res = inspectorSuccess;
+  uint64_t now = inspectorGetMonotonicTimeUsecs();
+  uint64_t nextRegularDump = dumper->sampleIntervalUsecs >= 0 ? now : UINT64_MAX;
+  uint64_t nextTimeoutCheck = inspectorCollTimeoutEnabled()
+                                ? now + dumper->timeoutCheckIntervalUsecs
+                                : UINT64_MAX;
 
-  while (dumper->run) {
-    inspectorLockWr(&dumper->guard);
-    if (!dumper->run) {
-      inspectorUnlockRWLock(&dumper->guard);
+  while (true) {
+    pthread_mutex_lock(&dumper->stateMutex);
+    while (dumper->run) {
+      now = inspectorGetMonotonicTimeUsecs();
+      if (now >= nextRegularDump || now >= nextTimeoutCheck) break;
+      uint64_t deadlineUsec = std::min(nextRegularDump, nextTimeoutCheck);
+      uint64_t waitUsec = deadlineUsec - now;
+      struct timespec deadline = {};
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_sec += waitUsec / 1000000ULL;
+      deadline.tv_nsec += (waitUsec % 1000000ULL) * 1000ULL;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+      }
+      pthread_cond_timedwait(&dumper->stateCond, &dumper->stateMutex, &deadline);
+    }
+    bool stopping = !dumper->run;
+    pthread_mutex_unlock(&dumper->stateMutex);
+
+    now = inspectorGetMonotonicTimeUsecs();
+    if (stopping) {
+      if (inspectorCollTimeoutEnabled()) {
+        std::vector<inspectorCollTimeoutInfo> timeoutRecords;
+        inspectorCollectTimedOutColls(timeoutRecords);
+        dumper->inspectorTimeoutDump(timeoutRecords);
+      }
       break;
     }
-    res = dumper->inspectorStateDump(dumper->outputRoot);
-    if (res == inspectorFileOpenError || res == inspectorDisabledError) {
-      inspectorUnlockRWLock(&dumper->guard);
-      break;
-    }
-    inspectorUnlockRWLock(&dumper->guard);
 
-    // Sleep only if interval > 0; if interval == 0, dump continuously
-    if (dumper->sampleIntervalUsecs > 0) {
-      std::this_thread::sleep_for(std::chrono::microseconds(dumper->sampleIntervalUsecs));
+    if (now >= nextTimeoutCheck) {
+      std::vector<inspectorCollTimeoutInfo> timeoutRecords;
+      inspectorCollectTimedOutColls(timeoutRecords);
+      dumper->inspectorTimeoutDump(timeoutRecords);
+      nextTimeoutCheck = now + dumper->timeoutCheckIntervalUsecs;
+    }
+
+    if (now >= nextRegularDump && dumper->outputRoot) {
+      inspectorResult_t dumpResult = dumper->inspectorStateDump(dumper->outputRoot);
+      if (dumpResult == inspectorFileOpenError ||
+          dumpResult == inspectorDisabledError) {
+        nextRegularDump = UINT64_MAX;
+        if (!inspectorCollTimeoutEnabled()) break;
+      } else {
+        nextRegularDump = dumper->sampleIntervalUsecs == 0
+                            ? now
+                            : now + (uint64_t)dumper->sampleIntervalUsecs;
+      }
     }
   }
 
@@ -734,44 +893,50 @@ void* inspectorDumpThread::dumpMain(void* arg) {
  *   inspectorResult_t - success or error code.
  */
 static inspectorResult_t inspectorStartDumpThread(int64_t intervalUsecs) {
-  if (intervalUsecs < 0) {
+  if (intervalUsecs < 0 && !inspectorCollTimeoutEnabled()) {
     INFO_INSPECTOR( "NCCL Inspector: dump thread disabled "
-                    "(interval is -1); not starting internal dump thread.");
+                    "(interval is -1 and timeout output is disabled).");
     return inspectorSuccess;
   }
 
-  char* dumpdir;
-  genDumpDir(&dumpdir);
-
-  if (dumpdir != nullptr) {
+  char* dumpdir = nullptr;
+  if (intervalUsecs >= 0) {
+    genDumpDir(&dumpdir);
     if (!ensureDir(dumpdir)) {
       free(dumpdir);
       INFO_INSPECTOR( "NCCL Inspector: failed to generate a dump dir; not "
-                      "starting internal dump thread.");
-      return inspectorSuccess;
+                      "starting normal output.");
+      dumpdir = nullptr;
     }
+  }
 
+  if (dumpdir || inspectorCollTimeoutEnabled()) {
     dumper = new inspectorDumpThread(dumpdir, intervalUsecs);
-    if (intervalUsecs == 0) {
+    if (dumpdir) {
+      if (intervalUsecs == 0) {
+        INFO_INSPECTOR(
+          "NCCL Inspector enabled with continuous dumping, "
+          "output directory %s, format %s",
+          dumpdir,
+          enableNcclInspectorPromDump ? "Prometheus" : "JSON");
+      } else {
+        INFO_INSPECTOR(
+          "NCCL Inspector enabled with polling interval %ld us, "
+          "output directory %s, format %s",
+          intervalUsecs, dumpdir,
+          enableNcclInspectorPromDump ? "Prometheus" : "JSON");
+      }
+    }
+    if (inspectorCollTimeoutEnabled()) {
       INFO_INSPECTOR(
-        "NCCL Inspector enabled with continuous dumping, "
-        "output directory %s, format %s",
-        dumpdir,
-        enableNcclInspectorPromDump ? "Prometheus" : "JSON");
-    } else {
-      INFO_INSPECTOR(
-        "NCCL Inspector enabled with polling interval %ld us, "
-        "output directory %s, format %s",
-        intervalUsecs, dumpdir,
-        enableNcclInspectorPromDump ? "Prometheus" : "JSON");
+        "NCCL Inspector collective timeout watchdog enabled: threshold %lu us, interval %lu us, path %s",
+        ncclInspectorCollTimeoutUsecs,
+        ncclInspectorDumpTimeoutIntervalUsecs,
+        ncclInspectorCollTimeoutPath);
     }
     dumper->startThread();
-
-    free(dumpdir);
-  } else {
-    INFO_INSPECTOR( "NCCL Inspector: failed to generate a dump "
-                    "dir; not starting internal dump thread.");
   }
+  if (dumpdir) free(dumpdir);
 
   return inspectorSuccess;
 }
@@ -839,6 +1004,9 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_COMM_POOL_SIZE", getenv("NCCL_INSPECTOR_COMM_POOL_SIZE"), "256", "Comm pool initial size/stride"},
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
+    {"NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS"), "10", "Collective timeout threshold in seconds; 0 disables"},
+    {"NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS", getenv("NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS"), "1000", "Collective timeout scan interval in milliseconds"},
+    {"NCCL_INSPECTOR_COLL_TIMEOUT_PATH", getenv("NCCL_INSPECTOR_COLL_TIMEOUT_PATH"), "(unset)", "Dedicated directory for timeout-only JSONL"},
   };
 
   const int numEnvVars = sizeof(envVars) / sizeof(envVars[0]);
@@ -1009,6 +1177,38 @@ static inspectorResult_t initDumpThreadFromEnv() {
   ncclInspectorDumpP2pRingSize
     = getRingSizeFromEnv("NCCL_INSPECTOR_DUMP_P2P_RING_SIZE", 1024);
 
+  str = getenv("NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS");
+  uint64_t timeoutSeconds = str ? strtoull(str, 0, 0) : 10;
+  ncclInspectorCollTimeoutUsecs =
+    timeoutSeconds > UINT64_MAX / 1000000ULL
+      ? UINT64_MAX
+      : timeoutSeconds * 1000000ULL;
+
+  str = getenv("NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS");
+  uint64_t timeoutIntervalMs = str ? strtoull(str, 0, 0) : 1000;
+  if (timeoutIntervalMs == 0) timeoutIntervalMs = 1000;
+  ncclInspectorDumpTimeoutIntervalUsecs =
+    timeoutIntervalMs > UINT64_MAX / 1000ULL
+      ? UINT64_MAX
+      : timeoutIntervalMs * 1000ULL;
+
+  if (ncclInspectorCollTimeoutPath) {
+    free(ncclInspectorCollTimeoutPath);
+    ncclInspectorCollTimeoutPath = nullptr;
+  }
+  const char* timeoutPath = getenv("NCCL_INSPECTOR_COLL_TIMEOUT_PATH");
+  ncclInspectorCollTimeoutOutputEnabled = false;
+  if (timeoutPath && timeoutPath[0] && ncclInspectorCollTimeoutUsecs > 0) {
+    ncclInspectorCollTimeoutPath = strdup(timeoutPath);
+    if (ncclInspectorCollTimeoutPath && ensureDir(ncclInspectorCollTimeoutPath)) {
+      ncclInspectorCollTimeoutOutputEnabled = true;
+    } else {
+      INFO_INSPECTOR(
+        "NCCL Inspector: collective timeout output disabled; invalid path %s",
+        timeoutPath);
+    }
+  }
+
   if (enableNcclInspectorDumpThread) {
     INS_CHK(inspectorStartDumpThread(ncclInspectorDumpIntervalUsecs));
   } else {
@@ -1016,6 +1216,11 @@ static inspectorResult_t initDumpThreadFromEnv() {
       "NCCL Inspector: NCCL_INSPECTOR_DUMP_THREAD_ENABLE set to 0; not "
       "starting internal dump "
       "thread.");
+    if (ncclInspectorCollTimeoutOutputEnabled) {
+      INFO_INSPECTOR(
+        "NCCL Inspector: collective timeout watchdog disabled because dump thread is disabled");
+      ncclInspectorCollTimeoutOutputEnabled = false;
+    }
   }
   return inspectorSuccess;
 }
@@ -1222,6 +1427,8 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->nnodes = nnodes;
   commInfo->dump_coll = false;
   commInfo->dump_p2p = false;
+  commInfo->activeHead = nullptr;
+  commInfo->activeTail = nullptr;
   commInfo->p2pSeqNum = 0;
   INS_CHK(inspectorRingInit(&commInfo->completedCollRing, ncclInspectorDumpCollRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
@@ -1372,6 +1579,45 @@ fail:
  * Return:
  *   inspectorResult_t - success or error code.
  */
+static void inspectorDetachActiveColls(struct inspectorCommInfo* commInfo) {
+  if (!commInfo) return;
+  inspectorLockWr(&commInfo->guard);
+  struct inspectorCollInfo* active = commInfo->activeHead;
+  commInfo->activeHead = nullptr;
+  commInfo->activeTail = nullptr;
+  inspectorUnlockRWLock(&commInfo->guard);
+
+  while (active) {
+    struct inspectorCollInfo* next = active->activeNext;
+    bool cleanup = false;
+    inspectorLockWr(&active->guard);
+    uint32_t refsToRelease = 0;
+    uint64_t pendingRecordRefs =
+      active->startedChannelMask & ~active->recordRefReleasedChannelMask;
+    uint64_t pendingStopRefs =
+      active->startedChannelMask & ~active->completedChannelMask;
+    refsToRelease += (uint32_t)__builtin_popcountll(pendingRecordRefs);
+    refsToRelease += (uint32_t)__builtin_popcountll(pendingStopRefs);
+    if (active->kernelCompletionRefHeld) {
+      refsToRelease += 1;
+      active->kernelCompletionRefHeld = false;
+    }
+    if (active->activeRegistered) refsToRelease += 1;
+    active->activeNext = nullptr;
+    active->activeRegistered = false;
+    active->commInfo = nullptr;
+    for (uint32_t i = 0; i < refsToRelease; i++) {
+      if (inspectorPluginCollInfoDeRef(active) == inspectorReturn) {
+        cleanup = true;
+        break;
+      }
+    }
+    inspectorUnlockRWLock(&active->guard);
+    if (cleanup) inspectorPluginCollInfoCleanup(active);
+    active = next;
+  }
+}
+
 inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
   struct inspectorCommInfoList* liveCommInfoList = &g_state.liveComms;
   struct inspectorCommInfoList* deletedCommInfoList = &g_state.deletedComms;
@@ -1404,6 +1650,8 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
                    commInfo->commHash);
     return inspectorDeleteUnknownCommError;
   }
+
+  inspectorDetachActiveColls(commInfoPtr);
 
   inspectorLockWr(&commInfoPtr->guard);
   commInfoPtr->dump_coll = false;
@@ -1547,37 +1795,201 @@ static uint64_t calculateKernelGpuExecTimeUsecs(struct inspectorKernelChInfo *ke
  *              timing is available.
  *
  */
-static uint64_t calculateMaxKernelExecTimeUsecs(struct inspectorCollInfo *collInfo,
-                                                inspectorTimingSource_t *timingSource) {
+static bool calculateKernelExecTimeStats(struct inspectorCollInfo *collInfo,
+                                         inspectorTimingSource_t *timingSource,
+                                         uint64_t *minExecTimeUsecs,
+                                         uint64_t *minChannel,
+                                         uint64_t *maxExecTimeUsecs,
+                                         uint64_t *maxChannel) {
+  uint64_t minKernelExecTimeUsecs = UINT64_MAX;
   uint64_t maxKernelExecTimeUsecs = 0;
+  uint64_t minKernelChannel = UINT64_MAX;
+  uint64_t maxKernelChannel = UINT64_MAX;
   inspectorTimingSource_t bestTimingSource = inspectorTimingSourceCollectiveCpu;
 
-  for (uint32_t i = 0; i < collInfo->nChannels; i++) {
+  uint64_t completedMask = collInfo->completedChannelMask;
+  while (completedMask != 0) {
+    uint32_t i = (uint32_t)__builtin_ctzll(completedMask);
+    completedMask &= completedMask - 1;
     struct inspectorKernelChInfo *kernelCh = &collInfo->kernelCh[i];
-    uint64_t gpuExecTimeUsecs = calculateKernelGpuExecTimeUsecs(kernelCh);
-    if (gpuExecTimeUsecs > 0) {
-      if (gpuExecTimeUsecs > maxKernelExecTimeUsecs) {
-        maxKernelExecTimeUsecs = gpuExecTimeUsecs;
-        bestTimingSource = inspectorTimingSourceKernelGpu;
-      }
-    } else {
-      if (kernelCh->tsCompletedUsec > kernelCh->tsStartUsec) {
-        uint64_t cpuExecTimeUsecs = kernelCh->tsCompletedUsec - kernelCh->tsStartUsec;
-        if (cpuExecTimeUsecs > maxKernelExecTimeUsecs) {
-          maxKernelExecTimeUsecs = cpuExecTimeUsecs;
-          bestTimingSource = inspectorTimingSourceKernelCpu;
-        }
-      }
+    uint64_t channelExecTimeUsecs = calculateKernelGpuExecTimeUsecs(kernelCh);
+    inspectorTimingSource_t channelTimingSource = inspectorTimingSourceKernelGpu;
+
+    if (channelExecTimeUsecs == 0 &&
+        kernelCh->tsCompletedUsec > kernelCh->tsStartUsec) {
+      channelExecTimeUsecs = kernelCh->tsCompletedUsec - kernelCh->tsStartUsec;
+      channelTimingSource = inspectorTimingSourceKernelCpu;
+    }
+    if (channelExecTimeUsecs == 0) continue;
+
+    uint64_t channel = kernelCh->channelId;
+    if (channelExecTimeUsecs < minKernelExecTimeUsecs) {
+      minKernelExecTimeUsecs = channelExecTimeUsecs;
+      minKernelChannel = channel;
+    }
+    if (channelExecTimeUsecs > maxKernelExecTimeUsecs) {
+      maxKernelExecTimeUsecs = channelExecTimeUsecs;
+      maxKernelChannel = channel;
+      bestTimingSource = channelTimingSource;
     }
   }
 
   if (maxKernelExecTimeUsecs > 0) {
     *timingSource = bestTimingSource;
-    return maxKernelExecTimeUsecs;
+    *minExecTimeUsecs = minKernelExecTimeUsecs;
+    *minChannel = minKernelChannel;
+    *maxExecTimeUsecs = maxKernelExecTimeUsecs;
+    *maxChannel = maxKernelChannel;
+    return true;
   } else {
     *timingSource = inspectorTimingSourceCollectiveCpu;
-    return collInfo->tsCompletedUsec - collInfo->tsStartUsec;
+    *minExecTimeUsecs = 0;
+    *minChannel = UINT64_MAX;
+    *maxExecTimeUsecs = 0;
+    *maxChannel = UINT64_MAX;
+    return false;
   }
+}
+
+static uint64_t calculateMaxKernelExecTimeUsecs(struct inspectorCollInfo *collInfo,
+                                                inspectorTimingSource_t *timingSource,
+                                                uint64_t *minExecTimeUsecs,
+                                                uint64_t *minChannel,
+                                                uint64_t *maxChannel) {
+  uint64_t maxExecTimeUsecs = 0;
+  if (calculateKernelExecTimeStats(collInfo, timingSource,
+                                   minExecTimeUsecs, minChannel,
+                                   &maxExecTimeUsecs, maxChannel)) {
+    return maxExecTimeUsecs;
+  }
+  return collInfo->tsCompletedUsec - collInfo->tsStartUsec;
+}
+
+static inspectorCollTimeoutReason_t inspectorClassifyCollTimeout(
+    uint32_t expectedChannels,
+    uint32_t startedChannels,
+    uint32_t completedChannels) {
+  if (expectedChannels > 0 && startedChannels == 0 && completedChannels == 0) {
+    return inspectorCollTimeoutOperationNotDispatched;
+  }
+  if (expectedChannels > startedChannels && startedChannels > completedChannels) {
+    return inspectorCollTimeoutGpuAndCommunicationIssue;
+  }
+  if (expectedChannels > startedChannels) {
+    return inspectorCollTimeoutGpuIssue;
+  }
+  if (startedChannels > completedChannels) {
+    return inspectorCollTimeoutCommunicationIssue;
+  }
+  return inspectorCollTimeoutUnknown;
+}
+
+static inspectorResult_t inspectorCollectTimedOutColls(
+    std::vector<inspectorCollTimeoutInfo>& timeoutRecords) {
+  timeoutRecords.clear();
+  if (!inspectorCollTimeoutEnabled()) return inspectorSuccess;
+
+  struct inspectorCommInfoList* commList = &g_state.liveComms;
+  inspectorResult_t res = inspectorLockRd(&commList->guard);
+  if (res != inspectorSuccess) return res;
+
+  uint64_t now = inspectorGetMonotonicTimeUsecs();
+  for (struct inspectorCommInfo* comm = commList->comms;
+       comm != nullptr; comm = comm->next) {
+    res = inspectorLockWr(&comm->guard);
+    if (res != inspectorSuccess) break;
+
+    for (struct inspectorCollInfo* coll = comm->activeHead;
+         coll != nullptr; coll = coll->activeNext) {
+      res = inspectorLockWr(&coll->guard);
+      if (res != inspectorSuccess) break;
+
+      bool completed = coll->nKernelChCompleted == coll->nKernelChStarted &&
+                       coll->nKernelChCompleted == coll->nChannels;
+      bool queueTimedOut = !completed && coll == comm->activeHead &&
+                           coll->nKernelChStarted == 0 &&
+                           coll->queueWatchStartUsec != 0 &&
+                           now >= coll->queueWatchStartUsec &&
+                           now - coll->queueWatchStartUsec >= ncclInspectorCollTimeoutUsecs &&
+                           !(coll->timeoutReportedMask & INSPECTOR_COLL_TIMEOUT_REPORTED_QUEUE);
+      bool executionTimedOut = !completed && coll->nKernelChStarted > 0 &&
+                               coll->executionStartUsec != 0 &&
+                               now >= coll->executionStartUsec &&
+                               now - coll->executionStartUsec >= ncclInspectorCollTimeoutUsecs &&
+                               !(coll->timeoutReportedMask &
+                                 INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION);
+      if (queueTimedOut || executionTimedOut) {
+        inspectorCollTimeoutInfo timeout = {};
+        snprintf(timeout.commName, sizeof(timeout.commName), "%s",
+                 comm->commName && comm->commName[0] ? comm->commName : "unknown");
+        snprintf(timeout.commHashStr, sizeof(timeout.commHashStr), "%s",
+                 comm->commHashStr);
+        timeout.rank = comm->rank;
+        timeout.nranks = comm->nranks;
+        timeout.nnodes = comm->nnodes;
+        timeout.func = ncclStringToFunc(coll->func);
+        timeout.collSeqNumber = coll->sn;
+        snprintf(timeout.algo, sizeof(timeout.algo), "%s",
+                 coll->algo && coll->algo[0] ? coll->algo : "unknown");
+        snprintf(timeout.proto, sizeof(timeout.proto), "%s",
+                 coll->proto && coll->proto[0] ? coll->proto : "unknown");
+        timeout.msgSizeBytes = coll->msgSizeBytes;
+        timeout.dumpTimestampUsec = inspectorGetTime();
+        uint64_t timeoutStartUsec = queueTimedOut
+                                      ? coll->queueWatchStartUsec
+                                      : coll->executionStartUsec;
+        timeout.timeoutElapsedMs = (now - timeoutStartUsec) / 1000ULL;
+        if (coll->queueWatchStartUsec != 0) {
+          uint64_t queueEndUsec = coll->executionStartUsec != 0
+                                    ? coll->executionStartUsec
+                                    : now;
+          if (queueEndUsec >= coll->queueWatchStartUsec) {
+            timeout.hasQueueWaitElapsed = true;
+            timeout.queueWaitElapsedMs =
+              (queueEndUsec - coll->queueWatchStartUsec) / 1000ULL;
+          }
+        }
+        if (coll->executionStartUsec != 0 && now >= coll->executionStartUsec) {
+          timeout.hasKernelExecutionElapsed = true;
+          timeout.kernelExecutionElapsedMs =
+            (now - coll->executionStartUsec) / 1000ULL;
+        }
+        timeout.expectedChannels = coll->nChannels;
+        if (timeout.expectedChannels > 0) {
+          timeout.hasEstimatedChannelPayloadBytes = true;
+          timeout.estimatedChannelPayloadBytes =
+            timeout.msgSizeBytes / timeout.expectedChannels +
+            (timeout.msgSizeBytes % timeout.expectedChannels != 0);
+        }
+
+        timeout.startedChannelMask = coll->startedChannelMask;
+        timeout.completedChannelMask = coll->completedChannelMask;
+        timeout.startedChannels = __builtin_popcountll(timeout.startedChannelMask);
+        timeout.completedChannels = __builtin_popcountll(timeout.completedChannelMask);
+        timeout.reason = queueTimedOut
+                           ? inspectorCollTimeoutOperationNotDispatched
+                           : inspectorClassifyCollTimeout(
+                               timeout.expectedChannels,
+                               timeout.startedChannels,
+                               timeout.completedChannels);
+        timeout.hasValidChannelTiming = calculateKernelExecTimeStats(
+          coll, &timeout.timingSource,
+          &timeout.minExecTimeUsecs, &timeout.minChannel,
+          &timeout.maxExecTimeUsecs, &timeout.maxChannel);
+
+        coll->timeoutReportedMask |= queueTimedOut
+                                       ? INSPECTOR_COLL_TIMEOUT_REPORTED_QUEUE
+                                       : INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION;
+        timeoutRecords.push_back(timeout);
+      }
+      inspectorUnlockRWLock(&coll->guard);
+    }
+    inspectorUnlockRWLock(&comm->guard);
+    if (res != inspectorSuccess) break;
+  }
+
+  inspectorUnlockRWLock(&commList->guard);
+  return res;
 }
 
 /*
@@ -1606,8 +2018,14 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->func = ncclStringToFunc(collInfo->func);
   completedOp->sn = collInfo->sn;
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
+  completedOp->nChannels =
+    (uint32_t)__builtin_popcountll(collInfo->completedChannelMask);
   completedOp->execTimeUsecs =
-    calculateMaxKernelExecTimeUsecs(collInfo, &completedOp->timingSource);
+    calculateMaxKernelExecTimeUsecs(collInfo,
+                                    &completedOp->timingSource,
+                                    &completedOp->min_execTimeUsecs,
+                                    &completedOp->min_channel,
+                                    &completedOp->max_channel);
   completedOp->algo = collInfo->algo;
   completedOp->proto = collInfo->proto;
   completedOp->evtTrk = collInfo->collEvtTrk;
@@ -1687,6 +2105,10 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->func = ncclStringToFunc(p2pInfo->func);
   completedOp->sn = p2pInfo->sn;
   completedOp->msgSizeBytes = p2pInfo->msgSizeBytes;
+  completedOp->nChannels = p2pInfo->nKernelChCompleted;
+  completedOp->min_execTimeUsecs = 0;
+  completedOp->min_channel = UINT64_MAX;
+  completedOp->max_channel = UINT64_MAX;
   completedOp->peer = p2pInfo->peer;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
@@ -1720,6 +2142,11 @@ inspectorResult_t inspectorGlobalFinalize() {
     delete dumper;
     dumper = nullptr;
   }
+  if (ncclInspectorCollTimeoutPath) {
+    free(ncclInspectorCollTimeoutPath);
+    ncclInspectorCollTimeoutPath = nullptr;
+  }
+  ncclInspectorCollTimeoutOutputEnabled = false;
   // Finalize event pools
   inspectorEventPoolFinalize();
   return inspectorSuccess;

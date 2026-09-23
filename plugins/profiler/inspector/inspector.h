@@ -146,6 +146,7 @@ struct inspectorCompletedOpInfo {
   ncclFunc_t func;
   uint64_t sn;
   size_t msgSizeBytes;
+  uint32_t nChannels;
   uint64_t execTimeUsecs;
   uint64_t min_execTimeUsecs;
   uint64_t min_channel;
@@ -166,6 +167,22 @@ enum {
   NCCL_COMM_NAME_MAX = 256
 };
 
+struct inspectorCollInfo;
+struct inspectorCollTimeoutInfo;
+
+typedef enum {
+  inspectorCollTimeoutOperationNotDispatched = 0,
+  inspectorCollTimeoutGpuAndCommunicationIssue,
+  inspectorCollTimeoutGpuIssue,
+  inspectorCollTimeoutCommunicationIssue,
+  inspectorCollTimeoutUnknown
+} inspectorCollTimeoutReason_t;
+
+enum {
+  INSPECTOR_COLL_TIMEOUT_REPORTED_QUEUE = 1 << 0,
+  INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION = 1 << 1,
+};
+
 struct inspectorCommInfo {
   struct inspectorCommInfo* next;
 
@@ -183,8 +200,44 @@ struct inspectorCommInfo {
   bool dump_p2p;
   struct inspectorCompletedRing completedCollRing;
   struct inspectorCompletedRing completedP2pRing;
+  // FIFO of active collectives in the order Inspector observes them.
+  struct inspectorCollInfo* activeHead;
+  struct inspectorCollInfo* activeTail;
   uint64_t p2pSeqNum;
   pthread_rwlock_t guard;
+};
+
+struct inspectorCollTimeoutInfo {
+  char commName[NCCL_COMM_NAME_MAX];
+  char commHashStr[NCCL_COMM_HASH_LENGTH];
+  int rank;
+  int nranks;
+  int nnodes;
+  ncclFunc_t func;
+  uint64_t collSeqNumber;
+  char algo[32];
+  char proto[32];
+  size_t msgSizeBytes;
+  uint64_t dumpTimestampUsec;
+  uint64_t timeoutElapsedMs;
+  bool hasQueueWaitElapsed;
+  uint64_t queueWaitElapsedMs;
+  bool hasKernelExecutionElapsed;
+  uint64_t kernelExecutionElapsedMs;
+  uint32_t expectedChannels;
+  bool hasEstimatedChannelPayloadBytes;
+  uint64_t estimatedChannelPayloadBytes;
+  uint32_t startedChannels;
+  uint32_t completedChannels;
+  uint64_t startedChannelMask;
+  uint64_t completedChannelMask;
+  inspectorCollTimeoutReason_t reason;
+  bool hasValidChannelTiming;
+  uint64_t minExecTimeUsecs;
+  uint64_t minChannel;
+  uint64_t maxExecTimeUsecs;
+  uint64_t maxChannel;
+  inspectorTimingSource_t timingSource;
 };
 
 // Structure to track flush times and file handles per device UUID
@@ -200,11 +253,16 @@ struct inspectorDumpThread {
   bool run{false};
   bool threadStarted{false};
   jsonFileOutput* jfo;
+  jsonFileOutput* timeoutJfo;
   char* outputRoot;
+  char* timeoutOutputRoot;
   int64_t sampleIntervalUsecs;
+  uint64_t timeoutCheckIntervalUsecs;
+  bool timeoutWriterFailed{false};
   std::vector<deviceFlushInfo> deviceFlushEntries;
   pthread_t pthread;
-  pthread_rwlock_t guard;
+  pthread_mutex_t stateMutex;
+  pthread_cond_t stateCond;
 
   // Constructor and destructor implemented in inspector.cc where dependencies are available
   inspectorDumpThread(const char* _outputRoot, int64_t _sampleIntervalUsecs);
@@ -222,6 +280,8 @@ struct inspectorDumpThread {
   inspectorResult_t inspectorStateDump(const char* output_root);
   inspectorResult_t inspectorStateDumpJSON(const char* output_root);
   inspectorResult_t inspectorStateDumpProm(const char* output_root);
+  inspectorResult_t inspectorTimeoutDump(
+      const std::vector<inspectorCollTimeoutInfo>& timeoutRecords);
   static void* dumpMain(void* arg);
 };
 
@@ -251,6 +311,18 @@ struct inspectorCollInfo {
   uint32_t nChannels;
   uint32_t nKernelChStarted;
   uint32_t nKernelChCompleted;
+  uint64_t startedChannelMask;
+  uint64_t recordRefReleasedChannelMask;
+  uint64_t completedChannelMask;
+  bool kernelCompletionRefHeld;
+  // Monotonic timestamp when this collective became FIFO-head eligible.
+  // Retained after execution starts so timeout JSON can report queue wait.
+  uint64_t queueWatchStartUsec;
+  // Monotonic timestamp of the first KernelCh start callback.
+  uint64_t executionStartUsec;
+  uint8_t timeoutReportedMask;
+  bool activeRegistered;
+  struct inspectorCollInfo* activeNext;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo collEvtTrk;
@@ -342,6 +414,14 @@ inspectorResult_t inspectorUnlockRWLock(pthread_rwlock_t* lockRef);
 inspectorResult_t inspectorGlobalInit(int rank);
 inspectorResult_t inspectorGlobalFinalize();
 uint64_t inspectorGetTime();
+uint64_t inspectorGetMonotonicTimeUsecs();
+bool inspectorCollTimeoutEnabled();
+void inspectorRegisterActiveColl(struct inspectorCommInfo* commInfo,
+                                 struct inspectorCollInfo* collInfo);
+bool inspectorUnregisterActiveColl(struct inspectorCommInfo* commInfo,
+                                   struct inspectorCollInfo* collInfo);
+inspectorResult_t inspectorPluginCollInfoDeRef(struct inspectorCollInfo* collInfo);
+void inspectorPluginCollInfoCleanup(struct inspectorCollInfo* collInfo);
 inspectorResult_t inspectorGetTimeUTC(char* buffer, size_t bufferSize);
 inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
                                    const char* commName, uint64_t commHash,

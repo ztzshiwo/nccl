@@ -215,6 +215,8 @@ static inline inspectorResult_t inspectorCompletedColl(jsonFileOutput* jfo,
 
     JSON_CHK(jsonKey(jfo, "coll_msg_size_bytes")); JSON_CHK(jsonUint64(jfo, op->msgSizeBytes));
 
+    JSON_CHK(jsonKey(jfo, "n_channels")); JSON_CHK(jsonUint32(jfo, op->nChannels));
+
     JSON_CHK(jsonKey(jfo, "coll_exec_time_us")); JSON_CHK(jsonUint64(jfo, op->execTimeUsecs));
 
     //JSON_CHK(jsonKey(jfo, "coll_timing_source")); JSON_CHK(jsonStr(jfo, inspectorTimingSourceToString(op->timingSource)));
@@ -384,6 +386,149 @@ static inspectorResult_t inspectorCommInfoDump(jsonFileOutput* jfo,
   INS_CHK(inspectorCommInfoDumpColl(jfo, commInfo, needs_writing));
   INS_CHK(inspectorCommInfoDumpP2p(jfo, commInfo, needs_writing));
   return inspectorSuccess;
+}
+
+static const char* inspectorCollTimeoutEventType(
+    inspectorCollTimeoutReason_t reason) {
+  switch (reason) {
+  case inspectorCollTimeoutOperationNotDispatched:
+    return "collective_timeout_operation_not_dispatched";
+  case inspectorCollTimeoutGpuAndCommunicationIssue:
+    return "collective_timeout_gpu_and_communication_issue";
+  case inspectorCollTimeoutGpuIssue:
+    return "collective_timeout_gpu_issue";
+  case inspectorCollTimeoutCommunicationIssue:
+    return "collective_timeout_communication_issue";
+  case inspectorCollTimeoutUnknown:
+  default:
+    return "collective_timeout_unknown";
+  }
+}
+
+inspectorResult_t inspectorCollTimeoutDump(
+    jsonFileOutput* jfo,
+    const std::vector<inspectorCollTimeoutInfo>& timeoutRecords) {
+  if (!jfo || timeoutRecords.empty()) return inspectorSuccess;
+  inspectorResult_t res = inspectorSuccess;
+  bool locked = false;
+  JSON_CHK_GOTO(jsonLockOutput(jfo), res, exit);
+  locked = true;
+  for (const inspectorCollTimeoutInfo& timeout : timeoutRecords) {
+    JSON_CHK_GOTO(jsonStartObject(jfo), res, exit);
+
+    JSON_CHK_GOTO(jsonKey(jfo, "header"), res, exit);
+    JSON_CHK_GOTO(jsonStartObject(jfo), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "id"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, timeout.commHashStr), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "comm_name"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, timeout.commName), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "rank"), res, exit);
+    JSON_CHK_GOTO(jsonInt(jfo, timeout.rank), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "n_ranks"), res, exit);
+    JSON_CHK_GOTO(jsonInt(jfo, timeout.nranks), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "nnodes"), res, exit);
+    JSON_CHK_GOTO(jsonInt(jfo, timeout.nnodes), res, exit);
+    JSON_CHK_GOTO(jsonFinishObject(jfo), res, exit);
+
+    JSON_CHK_GOTO(jsonKey(jfo, "metadata"), res, exit);
+    JSON_CHK_GOTO(jsonStartObject(jfo), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "event_type"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, inspectorCollTimeoutEventType(timeout.reason)), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "dump_timestamp_us"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.dumpTimestampUsec), res, exit);
+    char hostname[256] = {};
+    gethostname(hostname, sizeof(hostname) - 1);
+    JSON_CHK_GOTO(jsonKey(jfo, "hostname"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, hostname), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "pid"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, getpid()), res, exit);
+    JSON_CHK_GOTO(jsonFinishObject(jfo), res, exit);
+
+    JSON_CHK_GOTO(jsonKey(jfo, "coll_timeout"), res, exit);
+    JSON_CHK_GOTO(jsonStartObject(jfo), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "coll"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, ncclFuncToString(timeout.func)), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "coll_seq_number"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.collSeqNumber), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "algo"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, timeout.algo), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "proto"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, timeout.proto), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "coll_msg_size_bytes"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.msgSizeBytes), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "timeout_elapsed_ms"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.timeoutElapsedMs), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "queue_wait_elapsed_ms"), res, exit);
+    if (timeout.hasQueueWaitElapsed) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.queueWaitElapsedMs), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "kernel_execution_elapsed_ms"), res, exit);
+    if (timeout.hasKernelExecutionElapsed) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.kernelExecutionElapsedMs), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "expected_channels"), res, exit);
+    JSON_CHK_GOTO(jsonUint32(jfo, timeout.expectedChannels), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "estimated_channel_payload_bytes"), res, exit);
+    if (timeout.hasEstimatedChannelPayloadBytes) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.estimatedChannelPayloadBytes), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "started_channels"), res, exit);
+    JSON_CHK_GOTO(jsonUint32(jfo, timeout.startedChannels), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "completed_channels"), res, exit);
+    JSON_CHK_GOTO(jsonUint32(jfo, timeout.completedChannels), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "started_channel_mask"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.startedChannelMask), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "completed_channel_mask"), res, exit);
+    JSON_CHK_GOTO(jsonUint64(jfo, timeout.completedChannelMask), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "min_exec_time_us"), res, exit);
+    if (timeout.hasValidChannelTiming) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.minExecTimeUsecs), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "min_channel"), res, exit);
+    if (timeout.hasValidChannelTiming) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.minChannel), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "max_exec_time_us"), res, exit);
+    if (timeout.hasValidChannelTiming) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.maxExecTimeUsecs), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "max_channel"), res, exit);
+    if (timeout.hasValidChannelTiming) {
+      JSON_CHK_GOTO(jsonUint64(jfo, timeout.maxChannel), res, exit);
+    } else {
+      JSON_CHK_GOTO(jsonNull(jfo), res, exit);
+    }
+    JSON_CHK_GOTO(jsonKey(jfo, "timing_source"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, timeout.hasValidChannelTiming
+                                   ? inspectorTimingSourceToString(timeout.timingSource)
+                                   : "unavailable"),
+                  res, exit);
+    JSON_CHK_GOTO(jsonFinishObject(jfo), res, exit);
+    JSON_CHK_GOTO(jsonFinishObject(jfo), res, exit);
+    JSON_CHK_GOTO(jsonNewline(jfo), res, exit);
+  }
+  JSON_CHK_GOTO(jsonFlushOutput(jfo), res, exit);
+
+exit:
+  if (locked) {
+    jsonResult_t unlockResult = jsonUnlockOutput(jfo);
+    if (unlockResult != jsonSuccess && res == inspectorSuccess) {
+      res = inspectorJsonError;
+    }
+  }
+  return res;
 }
 
 
