@@ -241,14 +241,16 @@ static void inspectorPluginP2pInfoCleanup(struct inspectorP2pInfo *p2pInfo) {
  * Return:
  *   None.
  */
-static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
+// The returned construction lease survives until the opaque handle is copied
+// out, including when communicator teardown races event creation.
+static std::shared_ptr<inspectorCollInfo> inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
                                         ncclProfilerEventDescr_t *eDescr,
                                         struct inspectorCommInfo *commInfo) {
   struct inspectorCollInfo *collInfoPtr = inspectorEventPoolAllocColl();
   if (collInfoPtr == nullptr) {
     INFO_INSPECTOR("Inspector: Failed to allocate memory for collective info structure");
     *collInfo = nullptr;
-    return;
+    return {};
   }
   collInfoPtr->type = ncclProfileColl;
   collInfoPtr->refCount = 0;
@@ -268,6 +270,9 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
   collInfoPtr->timeoutReportedMask = 0;
   collInfoPtr->activeRegistered = false;
   collInfoPtr->activeNext = nullptr;
+  collInfoPtr->activePrev = nullptr;
+  collInfoPtr->retired = false;
+  collInfoPtr->parentStopped = false;
   collInfoPtr->msgSizeBytes =
     ncclTypeSize(inspectorStringToDatatype(eDescr->coll.datatype)) * eDescr->coll.count;
 
@@ -279,11 +284,15 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
                             NCCL_INSP_EVT_TRK_OP_START, collInfoPtr);
 
   inspectorLockInit(&collInfoPtr->guard);
-  if (inspectorCollTimeoutEnabled() && collInfoPtr->nChannels > 0) {
-    inspectorPluginCollInfoRef(collInfoPtr); // active registry ref
-    inspectorRegisterActiveColl(commInfo, collInfoPtr);
+  auto owner = inspectorPublishCollHandle(collInfoPtr);
+  if (!owner) {
+    *collInfo = nullptr;
+    return {};
   }
+  if (inspectorCollTimeoutEnabled() && collInfoPtr->nChannels > 0)
+    inspectorRegisterActiveColl(commInfo, collInfoPtr);
   *collInfo = collInfoPtr;
+  return owner;
 }
 
 static void inspectorPluginP2pInfoInit(struct inspectorP2pInfo **p2pInfo,
@@ -359,6 +368,16 @@ static void inspectorPluginKernelChInfoInitColl(struct inspectorKernelChInfo **k
                                                 ncclProfilerEventDescr_t *eDescr,
                                                 struct inspectorCollInfo *collInfo) {
   inspectorLockWr(&collInfo->guard);
+  if (collInfo->retired) {
+    inspectorUnlockRWLock(&collInfo->guard);
+    return;
+  }
+  uint64_t bit = 1ULL << eDescr->kernelCh.channelId;
+  if (collInfo->startedChannelMask & bit) {
+    *kernelChInfo = &collInfo->kernelCh[eDescr->kernelCh.channelId];
+    inspectorUnlockRWLock(&collInfo->guard);
+    return;
+  }
   struct inspectorEventTraceInfo *krnlEvtTrk =
     collInfo->collEvtTrk.kernelCh[eDescr->kernelCh.channelId].evntTrace;
   inspectorRecordEventTrace(krnlEvtTrk,
@@ -378,6 +397,7 @@ static void inspectorPluginKernelChInfoInitColl(struct inspectorKernelChInfo **k
   if (collInfo->nKernelChStarted == 0) {
     collInfo->tsStartUsec = kernelChInfoPtr->tsStartUsec;
     collInfo->executionStartUsec = inspectorGetMonotonicTimeUsecs();
+    inspectorMarkCollStarted(collInfo);
   }
   collInfo->nKernelChStarted += 1;
   collInfo->startedChannelMask |= 1ULL << eDescr->kernelCh.channelId;
@@ -428,7 +448,7 @@ static void inspectorPluginKernelChInfoInit(struct inspectorKernelChInfo **kerne
     *kernelChInfo = nullptr;
     return;
   }
-  if (eDescr->parentObj) {
+  if (eDescr->parentObj && !inspectorIsCollToken(eDescr->parentObj)) {
     uint64_t parentType = *(uint64_t*)eDescr->parentObj;
     if (parentType == ncclProfileColl) {
       struct inspectorCollInfo *collInfo = (struct inspectorCollInfo*)eDescr->parentObj;
@@ -512,8 +532,8 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     if (!inspectorShouldTrackColl(eDescr)) return ncclSuccess;
     struct inspectorCollInfo *collEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
-    inspectorPluginCollInfoInit(&collEvent, eDescr, commInfoCtx);
-    *eHandle = collEvent;
+    auto owner = inspectorPluginCollInfoInit(&collEvent, eDescr, commInfoCtx);
+    if (owner) *eHandle = inspectorCollToken(owner.get());
   } else if (eDescr->type == ncclProfileP2p) {
     if (!enableNcclInspectorP2p) return ncclSuccess;
     if (!inspectorShouldTrackP2p(eDescr)) return ncclSuccess;
@@ -522,6 +542,16 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     inspectorPluginP2pInfoInit(&p2pEvent, eDescr, commInfoCtx);
     *eHandle = p2pEvent;
   } else if (eDescr->type == ncclProfileKernelCh) {
+    if (inspectorIsCollToken(eDescr->parentObj)) {
+      if (eDescr->kernelCh.channelId >= MAX_CHANNELS ||
+          inspectorCollTokenKind(eDescr->parentObj) != 0) return ncclSuccess;
+      auto owner = inspectorAcquireCollHandle(eDescr->parentObj);
+      if (!owner) return ncclSuccess;
+      inspectorKernelChInfo* channel = nullptr;
+      inspectorPluginKernelChInfoInitColl(&channel, eDescr, owner.get());
+      if (channel) *eHandle = inspectorCollToken(owner.get(), eDescr->kernelCh.channelId + 1);
+      return ncclSuccess;
+    }
     struct inspectorKernelChInfo *kernelChEvent = nullptr;
     inspectorPluginKernelChInfoInit(&kernelChEvent, eDescr);
     *eHandle = kernelChEvent;
@@ -533,14 +563,12 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
 
 static ncclResult_t inspectorPluginStopEventColl(struct inspectorCollInfo *collInfo) {
   inspectorLockWr(&collInfo->guard);
-  inspectorRecordEventTrace(collInfo->collEvtTrk.evntTrace,
-                            NCCL_INSP_EVT_TRK_OP_STOP,
-                            collInfo);
-  inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
-  inspectorUnlockRWLock(&collInfo->guard);
-  if (res == inspectorReturn) {
-    inspectorPluginCollInfoCleanup(collInfo);
+  if (!collInfo->retired && !collInfo->parentStopped) {
+    inspectorRecordEventTrace(collInfo->collEvtTrk.evntTrace, NCCL_INSP_EVT_TRK_OP_STOP, collInfo);
+    collInfo->parentStopped = true;
+    inspectorPluginCollInfoDeRef(collInfo);
   }
+  inspectorUnlockRWLock(&collInfo->guard);
   return ncclSuccess;
 }
 
@@ -560,58 +588,34 @@ static ncclResult_t inspectorPluginStopEventP2p(struct inspectorP2pInfo *p2pInfo
 static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelChInfo *kernelChInfo,
                                                          struct inspectorCollInfo *collInfo) {
   struct inspectorCompletedOpInfo completedOp = {};
-  bool needsCleanup = false;
   bool collCompleted = false;
   bool emitCompleted = false;
-
   inspectorLockWr(&collInfo->guard);
-  struct inspectorCommInfo *commInfo = collInfo->commInfo;
-  struct inspectorEventTraceInfo *krnlEvtTrk =
-    collInfo->collEvtTrk.kernelCh[kernelChInfo->channelId].evntTrace;
-  inspectorRecordEventTrace(krnlEvtTrk,
-                            NCCL_INSP_EVT_TRK_KERNEL_STOP,
-                            collInfo);
-  kernelChInfo->tsCompletedUsec = inspectorGetTime();
-  collInfo->nKernelChCompleted += 1;
-  collInfo->completedChannelMask |= 1ULL << kernelChInfo->channelId;
-
-  inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
-  if (res == inspectorReturn) {
-    needsCleanup = true;
-    goto done;
+  auto* commInfo = collInfo->commInfo;
+  uint64_t bit = 1ULL << kernelChInfo->channelId;
+  if (collInfo->retired || !(collInfo->startedChannelMask & bit) ||
+      (collInfo->completedChannelMask & bit)) {
+    inspectorUnlockRWLock(&collInfo->guard);
+    return ncclSuccess;
   }
-
-  if ((collInfo->nKernelChCompleted == collInfo->nKernelChStarted)
-      && (collInfo->nKernelChCompleted == collInfo->nChannels)) {
+  inspectorRecordEventTrace(collInfo->collEvtTrk.kernelCh[kernelChInfo->channelId].evntTrace,
+                            NCCL_INSP_EVT_TRK_KERNEL_STOP, collInfo);
+  kernelChInfo->tsCompletedUsec = inspectorGetTime();
+  ++collInfo->nKernelChCompleted;
+  collInfo->completedChannelMask |= bit;
+  inspectorPluginCollInfoDeRef(collInfo);
+  if (collInfo->nKernelChCompleted == collInfo->nKernelChStarted &&
+      collInfo->nKernelChCompleted == collInfo->nChannels) {
     collInfo->tsCompletedUsec = kernelChInfo->tsCompletedUsec;
     collCompleted = true;
     inspectorUpdateCollPerf(&completedOp, collInfo);
-    emitCompleted = !requireKernelTiming ||
-                    completedOp.timingSource == inspectorTimingSourceKernelGpu;
-
-    res = inspectorPluginCollInfoDeRef(collInfo);
+    emitCompleted = !requireKernelTiming || completedOp.timingSource == inspectorTimingSourceKernelGpu;
+    inspectorPluginCollInfoDeRef(collInfo);
     collInfo->kernelCompletionRefHeld = false;
-    if (res == inspectorReturn) {
-      needsCleanup = true;
-    }
   }
-
-done:
   inspectorUnlockRWLock(&collInfo->guard);
-
-  if (collCompleted && inspectorUnregisterActiveColl(commInfo, collInfo)) {
-    inspectorLockWr(&collInfo->guard);
-    res = inspectorPluginCollInfoDeRef(collInfo); // release active registry ref
-    inspectorUnlockRWLock(&collInfo->guard);
-    if (res == inspectorReturn) needsCleanup = true;
-  }
-
-  if (needsCleanup) {
-    inspectorPluginCollInfoCleanup(collInfo);
-  }
-  if (collCompleted && emitCompleted && commInfo) {
-    inspectorUpdateCommOpInfo(commInfo, &completedOp);
-  }
+  if (collCompleted) inspectorUnregisterActiveColl(commInfo, collInfo);
+  if (collCompleted && emitCompleted) inspectorUpdateCommOpInfo(commInfo, &completedOp);
   return ncclSuccess;
 }
 
@@ -685,25 +689,17 @@ static ncclResult_t inspectorPluginStopEventKernelCh(struct inspectorKernelChInf
 static ncclResult_t inspectorPluginRecordEventStateKernelChColl(struct inspectorKernelChInfo *kernelChInfo,
                                                                 struct inspectorCollInfo *collInfo,
                                                                 ncclProfilerEventStateArgs_t* eStateArgs) {
-  bool needsCleanup = false;
   inspectorLockWr(&collInfo->guard);
-  struct inspectorEventTraceInfo *krnlEvtTrk
-    = collInfo->collEvtTrk.kernelCh[kernelChInfo->channelId].evntTrace;
-  inspectorRecordEventTrace(krnlEvtTrk,
-                            NCCL_INSP_EVT_TRK_KERNEL_RECORD,
-                            collInfo);
-  kernelChInfo->stopGpuClk = eStateArgs->kernelCh.pTimer;
-  if (kernelChInfo->startGpuClk != 0) {
-    collInfo->recordRefReleasedChannelMask |= 1ULL << kernelChInfo->channelId;
-    inspectorResult_t res = inspectorPluginCollInfoDeRef(collInfo);
-    if (res == inspectorReturn) {
-      needsCleanup = true;
-    }
+  uint64_t bit = 1ULL << kernelChInfo->channelId;
+  if (!collInfo->retired && (collInfo->startedChannelMask & bit) &&
+      !(collInfo->recordRefReleasedChannelMask & bit)) {
+    inspectorRecordEventTrace(collInfo->collEvtTrk.kernelCh[kernelChInfo->channelId].evntTrace,
+                              NCCL_INSP_EVT_TRK_KERNEL_RECORD, collInfo);
+    kernelChInfo->stopGpuClk = eStateArgs->kernelCh.pTimer;
+    collInfo->recordRefReleasedChannelMask |= bit;
+    inspectorPluginCollInfoDeRef(collInfo);
   }
   inspectorUnlockRWLock(&collInfo->guard);
-  if (needsCleanup) {
-    inspectorPluginCollInfoCleanup(collInfo);
-  }
   return ncclSuccess;
 }
 
@@ -771,6 +767,16 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
     return ncclSuccess;
   }
 
+  if (inspectorIsCollToken(eHandle)) {
+    auto owner = inspectorAcquireCollHandle(eHandle);
+    if (!owner) return ncclSuccess;
+    unsigned kind = inspectorCollTokenKind(eHandle);
+    ncclResult_t result = kind == 0 ? inspectorPluginStopEventColl(owner.get())
+      : inspectorPluginStopEventKernelChColl(&owner->kernelCh[kind - 1], owner.get());
+    inspectorMaybeReleaseCollHandle(owner);
+    return result;
+  }
+
   uint64_t type = *(uint64_t *)eHandle;
   if (type == ncclProfileColl) {
     struct inspectorCollInfo *collInfo = (struct inspectorCollInfo *)eHandle;
@@ -813,6 +819,15 @@ __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
                                                       ncclProfilerEventStateArgs_t* eStateArgs) {
   if (eHandle == nullptr || eStateArgs == nullptr)
     return ncclSuccess;
+
+  if (inspectorIsCollToken(eHandle)) {
+    auto owner = inspectorAcquireCollHandle(eHandle);
+    unsigned kind = inspectorCollTokenKind(eHandle);
+    if (!owner || !kind || eState != ncclProfilerKernelChStop) return ncclSuccess;
+    auto result = inspectorPluginRecordEventStateKernelChColl(&owner->kernelCh[kind - 1], owner.get(), eStateArgs);
+    inspectorMaybeReleaseCollHandle(owner);
+    return result;
+  }
 
   uint64_t type = *(uint64_t *)eHandle;
 

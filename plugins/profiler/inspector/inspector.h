@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include <memory>
 
 #include "json.h"
 #include "common.h"
@@ -203,6 +204,11 @@ struct inspectorCommInfo {
   // FIFO of active collectives in the order Inspector observes them.
   struct inspectorCollInfo* activeHead;
   struct inspectorCollInfo* activeTail;
+  struct inspectorCollInfo* scanEnd; // first live node outside the scan window
+  uint64_t nextCollSequence;         // protected by guard, across all coll types
+  uint64_t furthestStartedSequence;  // atomic builtins; survives completed nodes
+  bool collHandlesClosing;          // protected by the handle registry mutex
+  size_t collHandleObjects;         // includes callbacks in flight
   uint64_t p2pSeqNum;
   pthread_rwlock_t guard;
 };
@@ -299,7 +305,7 @@ struct inspectorKernelChInfo {
 
 struct inspectorCollInfo {
   uint64_t type;
-  int refCount;
+  int refCount; // outstanding normal callbacks; registry/leases own the storage
   struct inspectorCommInfo *commInfo;
   const char* func;
   const char* algo;
@@ -322,6 +328,11 @@ struct inspectorCollInfo {
   uint64_t executionStartUsec;
   uint8_t timeoutReportedMask;
   bool activeRegistered;
+  bool retired;
+  bool parentStopped;
+  uintptr_t handleId;
+  uint64_t trackingSequence;
+  struct inspectorCollInfo* activePrev;
   struct inspectorCollInfo* activeNext;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
@@ -422,6 +433,18 @@ bool inspectorUnregisterActiveColl(struct inspectorCommInfo* commInfo,
                                    struct inspectorCollInfo* collInfo);
 inspectorResult_t inspectorPluginCollInfoDeRef(struct inspectorCollInfo* collInfo);
 void inspectorPluginCollInfoCleanup(struct inspectorCollInfo* collInfo);
+// Collective handles are opaque tagged IDs. Registry leases, not callback
+// expectations, own the memory. P2P handles remain aligned object pointers.
+bool inspectorIsCollToken(void* handle);
+unsigned inspectorCollTokenKind(void* handle); // 0 = parent, channel + 1 = child
+void* inspectorCollToken(const inspectorCollInfo* coll, unsigned kind = 0);
+std::shared_ptr<inspectorCollInfo> inspectorPublishCollHandle(inspectorCollInfo* coll);
+std::shared_ptr<inspectorCollInfo> inspectorAcquireCollHandle(void* handle);
+void inspectorEraseCollHandle(uintptr_t id);
+void inspectorMaybeReleaseCollHandle(const std::shared_ptr<inspectorCollInfo>& coll);
+void inspectorBeginCloseCollHandles(inspectorCommInfo* comm);
+void inspectorCloseCollHandles(inspectorCommInfo* comm);
+void inspectorMarkCollStarted(inspectorCollInfo* coll);
 inspectorResult_t inspectorGetTimeUTC(char* buffer, size_t bufferSize);
 inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
                                    const char* commName, uint64_t commHash,

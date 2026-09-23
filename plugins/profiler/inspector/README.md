@@ -101,7 +101,7 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
 - `NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING=<0|1>` (default: `1`)
   When enabled (default), only events with GPU-based kernel timing (`kernel_gpu`) are recorded. Events that fall back to CPU-measured timing (`kernel_cpu` or `collective_cpu`) are silently discarded. Set to `0` to restore the previous fallback behaviour and retain all events regardless of timing source.
 - `NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS=<seconds>` (default: `10`)
-  Sets both timeout-stage budgets. The FIFO head times out if no KernelCh starts within this many seconds after it becomes eligible to run. After the first KernelCh starts, the same budget is measured again from the execution start. Set to `0` to disable timeout detection.
+  Sets both timeout-stage budgets. An eligible unstarted record reaches its queue deadline after this many seconds (FIFO head, or an unstarted gap passed by the scan window). After the first KernelCh starts, the same budget is measured again from the execution start. Set to `0` to disable timeout detection.
 - `NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS=<milliseconds>` (default: `1000`)
   Sets how often the dump thread scans active collectives for timeout. This is the scan period, not the timeout threshold.
 - `NCCL_INSPECTOR_COLL_TIMEOUT_PATH=<output_dir>` (default: unset)
@@ -115,7 +115,21 @@ export NCCL_INSPECTOR_DUMP_TIMEOUT_INTERVAL_MS=1000
 export NCCL_INSPECTOR_COLL_TIMEOUT_PATH=/tmp/nccl-inspector-timeouts
 ```
 
-The timeout watchdog reuses the Inspector dump thread. It still runs when the normal dump interval is `-1`, but it is disabled when `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. No timeout file is created when no collective times out. Active collectives are tracked in the order Inspector observes them. Only the FIFO head has a queue-wait budget; when it completes, the next not-yet-started collective receives a fresh budget. A collective that has started is checked against an independent execution budget. A queue timeout and an execution timeout can each be emitted at most once, and a timed-out collective that later completes is still written to the normal completed-operation output.
+The timeout watchdog reuses the Inspector dump thread. It still runs when the normal dump interval is `-1`, but it is disabled when `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. No timeout file is created when no collective times out.
+
+Active collectives have a communicator-local registration sequence across all collective types. The first KernelCh start advances the furthest-started sequence. Each watchdog scan extends its window through that sequence, including gaps whose start callbacks have not arrived. An unstarted gap receives a fresh queue-wait budget when it first enters the window. With no later start evidence, the physical FIFO head retains its queue-wait budget. Started collectives use an independent budget from their first KernelCh start; advancing the window never resets an existing budget. Completed records can leave the list out of order, and a completed later record still advances the window. Records outside the window continue to receive callbacks normally.
+
+At the configured stage deadline, the watchdog silently discards a collective if **exactly one expected channel has neither an observed start nor completion**, and every observed channel has completed. Counts must satisfy `expected >= 1` and `started == completed == expected - 1`; the started/completed masks must match and their popcounts must match the counts. This deliberately includes `expected=1, started=completed=0`. The discarded record produces neither timeout JSON nor a synthetic completed record. It leaves the active list, so later scans do not revisit it. There is no additional 30-second grace period: the existing `NCCL_INSPECTOR_COLL_TIMEOUT_SECONDS` setting is the deadline. This is an explicit diagnostic suppression policy, not proof that the missing channel completed on the GPU.
+
+Other states retain their existing timeout classification, with at most one queue timeout and one execution timeout per collective. Those records can still complete normally later. Collective/KernelCh callback handles are tagged, non-reused IDs resolved through an internal hash registry. Retired handles return success without accessing old storage. An already-entered callback holds a temporary ownership lease; storage returns to the event pool when the last lease ends. Pool chunks may retain their peak capacity. P2P tracking semantics, the profiler v5 ABI, and JSON schemas are unchanged.
+
+Host-only regression commands (CUDA declarations are stubbed; these do not validate GPU execution):
+
+```bash
+python3 plugins/profiler/inspector/tests/inspector_timeout_lifecycle_test.py
+python3 plugins/profiler/inspector/tests/inspector_timeout_lifecycle_test.py --sanitize
+python3 plugins/profiler/inspector/tests/inspector_timeout_lifecycle_test.py --thread-sanitize
+```
 
 The `metadata.event_type` value classifies the observed timeout state. Consumers that previously matched the exact value `collective_timeout` must instead match the `collective_timeout_` prefix:
 
@@ -127,7 +141,7 @@ The `metadata.event_type` value classifies the observed timeout state. Consumers
 | `started > completed` | `collective_timeout_communication_issue` |
 | Any other inconsistent combination | `collective_timeout_unknown` |
 
-Each timeout is appended as one JSON object. `timeout_elapsed_ms` is the elapsed time for the stage that triggered the record. `queue_wait_elapsed_ms` measures time from FIFO-head eligibility to the first KernelCh start (or to the queue timeout), while `kernel_execution_elapsed_ms` measures time since the first KernelCh start. A collective that starts before it becomes FIFO head reports `null` for queue wait. `estimated_channel_payload_bytes` is the ceiling of collective message bytes divided by expected channels; it is an Inspector-only equal-partition payload estimate, not an exact NCCL work slice or network wire-byte count. A timeout with no completed channel reports `null` for min/max timing and channel fields:
+Each timeout is appended as one JSON object. `timeout_elapsed_ms` is the elapsed time for the stage that triggered the record. `queue_wait_elapsed_ms` measures time from queue-watch eligibility (FIFO head or admission as an unstarted gap) to the first KernelCh start (or to the queue timeout), while `kernel_execution_elapsed_ms` measures time since the first KernelCh start. A collective that starts before its queue watch is armed reports `null` for queue wait. `estimated_channel_payload_bytes` is the ceiling of collective message bytes divided by expected channels; it is an Inspector-only equal-partition payload estimate, not an exact NCCL work slice or network wire-byte count. A timeout with no completed channel reports `null` for min/max timing and channel fields:
 
 ```json
 {

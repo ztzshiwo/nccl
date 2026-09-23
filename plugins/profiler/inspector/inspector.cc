@@ -113,10 +113,18 @@ uint64_t inspectorGetTime() {
   return ts;
 }
 
+#ifdef INSPECTOR_TESTING
+uint64_t inspectorTestNowUsec = 1;
+uint64_t inspectorTestScanVisits = 0;
+#endif
 uint64_t inspectorGetMonotonicTimeUsecs() {
+#ifdef INSPECTOR_TESTING
+  return __atomic_load_n(&inspectorTestNowUsec, __ATOMIC_RELAXED);
+#else
   struct timespec ts = {};
   if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
   return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+#endif
 }
 
 bool inspectorCollTimeoutEnabled() {
@@ -296,60 +304,61 @@ inspectorResult_t inspectorUnlockRWLock(pthread_rwlock_t* lockRef) {
   }
 }
 
+// Caller holds comm->guard and coll->guard. Does not release object ownership.
+static void inspectorUnlinkActiveCollLocked(inspectorCommInfo* comm, inspectorCollInfo* coll) {
+  if (comm->scanEnd == coll) comm->scanEnd = coll->activeNext;
+  if (coll->activePrev) coll->activePrev->activeNext = coll->activeNext;
+  else comm->activeHead = coll->activeNext;
+  if (coll->activeNext) coll->activeNext->activePrev = coll->activePrev;
+  else comm->activeTail = coll->activePrev;
+  coll->activePrev = coll->activeNext = nullptr;
+  coll->activeRegistered = false;
+}
+
+// Caller holds comm->guard, but no collective lock.
+static void inspectorArmActiveHeadLocked(inspectorCommInfo* comm, uint64_t now) {
+  if (!comm->activeHead) return;
+  auto* head = comm->activeHead;
+  inspectorLockWr(&head->guard);
+  if (!head->nKernelChStarted && !head->executionStartUsec && !head->queueWatchStartUsec)
+    head->queueWatchStartUsec = now;
+  inspectorUnlockRWLock(&head->guard);
+}
+
 void inspectorRegisterActiveColl(struct inspectorCommInfo* commInfo,
                                  struct inspectorCollInfo* collInfo) {
   if (!commInfo || !collInfo) return;
   inspectorLockWr(&commInfo->guard);
-  collInfo->activeNext = nullptr;
-  if (commInfo->activeTail) {
-    commInfo->activeTail->activeNext = collInfo;
-    commInfo->activeTail = collInfo;
-  } else {
-    inspectorLockWr(&collInfo->guard);
-    collInfo->queueWatchStartUsec = inspectorGetMonotonicTimeUsecs();
+  inspectorLockWr(&collInfo->guard);
+  if (collInfo->retired) {
     inspectorUnlockRWLock(&collInfo->guard);
-    commInfo->activeHead = collInfo;
-    commInfo->activeTail = collInfo;
+    inspectorUnlockRWLock(&commInfo->guard);
+    return;
   }
+  collInfo->trackingSequence = ++commInfo->nextCollSequence;
+  collInfo->activePrev = commInfo->activeTail;
+  collInfo->activeNext = nullptr;
+  if (commInfo->activeTail) commInfo->activeTail->activeNext = collInfo;
+  else {
+    commInfo->activeHead = collInfo;
+    collInfo->queueWatchStartUsec = inspectorGetMonotonicTimeUsecs();
+  }
+  commInfo->activeTail = collInfo;
+  if (!commInfo->scanEnd) commInfo->scanEnd = collInfo;
   collInfo->activeRegistered = true;
+  inspectorUnlockRWLock(&collInfo->guard);
   inspectorUnlockRWLock(&commInfo->guard);
 }
 
 bool inspectorUnregisterActiveColl(struct inspectorCommInfo* commInfo,
                                    struct inspectorCollInfo* collInfo) {
   if (!commInfo || !collInfo) return false;
-  bool removed = false;
   inspectorLockWr(&commInfo->guard);
-  struct inspectorCollInfo* prev = nullptr;
-  struct inspectorCollInfo* current = commInfo->activeHead;
-  while (current) {
-    if (current == collInfo) {
-      struct inspectorCollInfo* next = current->activeNext;
-      bool removedHead = prev == nullptr;
-      if (prev) {
-        prev->activeNext = next;
-      } else {
-        commInfo->activeHead = next;
-      }
-      if (commInfo->activeTail == current) {
-        commInfo->activeTail = prev;
-      }
-      collInfo->activeNext = nullptr;
-      collInfo->activeRegistered = false;
-      if (removedHead && next) {
-        inspectorLockWr(&next->guard);
-        if (next->nKernelChStarted == 0 && next->executionStartUsec == 0 &&
-            next->queueWatchStartUsec == 0) {
-          next->queueWatchStartUsec = inspectorGetMonotonicTimeUsecs();
-        }
-        inspectorUnlockRWLock(&next->guard);
-      }
-      removed = true;
-      break;
-    }
-    prev = current;
-    current = current->activeNext;
-  }
+  inspectorLockWr(&collInfo->guard);
+  bool removed = collInfo->activeRegistered;
+  if (removed) inspectorUnlinkActiveCollLocked(commInfo, collInfo);
+  inspectorUnlockRWLock(&collInfo->guard);
+  if (removed) inspectorArmActiveHeadLocked(commInfo, inspectorGetMonotonicTimeUsecs());
   inspectorUnlockRWLock(&commInfo->guard);
   return removed;
 }
@@ -1429,6 +1438,11 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_p2p = false;
   commInfo->activeHead = nullptr;
   commInfo->activeTail = nullptr;
+  commInfo->scanEnd = nullptr;
+  commInfo->nextCollSequence = 0;
+  commInfo->furthestStartedSequence = 0;
+  commInfo->collHandlesClosing = false;
+  commInfo->collHandleObjects = 0;
   commInfo->p2pSeqNum = 0;
   INS_CHK(inspectorRingInit(&commInfo->completedCollRing, ncclInspectorDumpCollRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
@@ -1580,42 +1594,15 @@ fail:
  *   inspectorResult_t - success or error code.
  */
 static void inspectorDetachActiveColls(struct inspectorCommInfo* commInfo) {
-  if (!commInfo) return;
   inspectorLockWr(&commInfo->guard);
-  struct inspectorCollInfo* active = commInfo->activeHead;
-  commInfo->activeHead = nullptr;
-  commInfo->activeTail = nullptr;
-  inspectorUnlockRWLock(&commInfo->guard);
-
-  while (active) {
-    struct inspectorCollInfo* next = active->activeNext;
-    bool cleanup = false;
-    inspectorLockWr(&active->guard);
-    uint32_t refsToRelease = 0;
-    uint64_t pendingRecordRefs =
-      active->startedChannelMask & ~active->recordRefReleasedChannelMask;
-    uint64_t pendingStopRefs =
-      active->startedChannelMask & ~active->completedChannelMask;
-    refsToRelease += (uint32_t)__builtin_popcountll(pendingRecordRefs);
-    refsToRelease += (uint32_t)__builtin_popcountll(pendingStopRefs);
-    if (active->kernelCompletionRefHeld) {
-      refsToRelease += 1;
-      active->kernelCompletionRefHeld = false;
-    }
-    if (active->activeRegistered) refsToRelease += 1;
-    active->activeNext = nullptr;
-    active->activeRegistered = false;
-    active->commInfo = nullptr;
-    for (uint32_t i = 0; i < refsToRelease; i++) {
-      if (inspectorPluginCollInfoDeRef(active) == inspectorReturn) {
-        cleanup = true;
-        break;
-      }
-    }
-    inspectorUnlockRWLock(&active->guard);
-    if (cleanup) inspectorPluginCollInfoCleanup(active);
-    active = next;
+  while (commInfo->activeHead) {
+    auto* coll = commInfo->activeHead;
+    inspectorLockWr(&coll->guard);
+    coll->retired = true;
+    inspectorUnlinkActiveCollLocked(commInfo, coll);
+    inspectorUnlockRWLock(&coll->guard);
   }
+  inspectorUnlockRWLock(&commInfo->guard);
 }
 
 inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
@@ -1651,7 +1638,9 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
     return inspectorDeleteUnknownCommError;
   }
 
+  inspectorBeginCloseCollHandles(commInfoPtr);
   inspectorDetachActiveColls(commInfoPtr);
+  inspectorCloseCollHandles(commInfoPtr);
 
   inspectorLockWr(&commInfoPtr->guard);
   commInfoPtr->dump_coll = false;
@@ -1893,20 +1882,36 @@ static inspectorResult_t inspectorCollectTimedOutColls(
   inspectorResult_t res = inspectorLockRd(&commList->guard);
   if (res != inspectorSuccess) return res;
 
+  std::vector<uintptr_t> retiredHandles;
   uint64_t now = inspectorGetMonotonicTimeUsecs();
   for (struct inspectorCommInfo* comm = commList->comms;
        comm != nullptr; comm = comm->next) {
     res = inspectorLockWr(&comm->guard);
     if (res != inspectorSuccess) break;
 
-    for (struct inspectorCollInfo* coll = comm->activeHead;
-         coll != nullptr; coll = coll->activeNext) {
+    uint64_t startedThrough = __atomic_load_n(&comm->furthestStartedSequence, __ATOMIC_ACQUIRE);
+    while (comm->scanEnd && comm->scanEnd->trackingSequence <= startedThrough) {
+      auto* entering = comm->scanEnd;
+      inspectorLockWr(&entering->guard);
+      if (!entering->nKernelChStarted && !entering->executionStartUsec && !entering->queueWatchStartUsec)
+        entering->queueWatchStartUsec = now;
+      inspectorUnlockRWLock(&entering->guard);
+      comm->scanEnd = entering->activeNext;
+    }
+    // With no starts, still inspect the physical head for queue timeout.
+    auto* stop = comm->scanEnd == comm->activeHead && comm->activeHead
+                   ? comm->activeHead->activeNext : comm->scanEnd;
+    for (auto* coll = comm->activeHead; coll && coll != stop;) {
+      auto* next = coll->activeNext;
+#ifdef INSPECTOR_TESTING
+      ++inspectorTestScanVisits;
+#endif
       res = inspectorLockWr(&coll->guard);
       if (res != inspectorSuccess) break;
 
       bool completed = coll->nKernelChCompleted == coll->nKernelChStarted &&
                        coll->nKernelChCompleted == coll->nChannels;
-      bool queueTimedOut = !completed && coll == comm->activeHead &&
+      bool queueTimedOut = !completed &&
                            coll->nKernelChStarted == 0 &&
                            coll->queueWatchStartUsec != 0 &&
                            now >= coll->queueWatchStartUsec &&
@@ -1919,6 +1924,28 @@ static inspectorResult_t inspectorCollectTimedOutColls(
                                !(coll->timeoutReportedMask &
                                  INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION);
       if (queueTimedOut || executionTimedOut) {
+        bool missingOne = coll->nChannels >= 1 &&
+            coll->nKernelChStarted == coll->nChannels - 1 &&
+            coll->nKernelChCompleted == coll->nKernelChStarted &&
+            coll->startedChannelMask == coll->completedChannelMask &&
+            unsigned(__builtin_popcountll(coll->startedChannelMask)) == coll->nKernelChStarted &&
+            unsigned(__builtin_popcountll(coll->completedChannelMask)) == coll->nKernelChCompleted;
+        if (missingOne) {
+          // Allocate the deferred erase entry before unlinking. Registry owners
+          // are released only after dropping communicator/collective locks.
+          try { retiredHandles.push_back(coll->handleId); }
+          catch (...) {
+            res = inspectorMemoryError;
+            inspectorUnlockRWLock(&coll->guard);
+            break;
+          }
+          coll->retired = true;
+          inspectorUnlinkActiveCollLocked(comm, coll);
+          inspectorUnlockRWLock(&coll->guard);
+          inspectorArmActiveHeadLocked(comm, now);
+          coll = next;
+          continue;
+        }
         inspectorCollTimeoutInfo timeout = {};
         snprintf(timeout.commName, sizeof(timeout.commName), "%s",
                  comm->commName && comm->commName[0] ? comm->commName : "unknown");
@@ -1980,15 +2007,26 @@ static inspectorResult_t inspectorCollectTimedOutColls(
         coll->timeoutReportedMask |= queueTimedOut
                                        ? INSPECTOR_COLL_TIMEOUT_REPORTED_QUEUE
                                        : INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION;
-        timeoutRecords.push_back(timeout);
+
+        try {
+          timeoutRecords.push_back(std::move(timeout));
+        } catch (...) {
+          inspectorUnlockRWLock(&coll->guard);
+          inspectorUnlockRWLock(&comm->guard);
+          inspectorUnlockRWLock(&commList->guard);
+          for (auto id : retiredHandles) inspectorEraseCollHandle(id);
+          return inspectorMemoryError;
+        }
       }
       inspectorUnlockRWLock(&coll->guard);
+      coll = next;
     }
     inspectorUnlockRWLock(&comm->guard);
     if (res != inspectorSuccess) break;
   }
 
   inspectorUnlockRWLock(&commList->guard);
+  for (auto id : retiredHandles) inspectorEraseCollHandle(id);
   return res;
 }
 
