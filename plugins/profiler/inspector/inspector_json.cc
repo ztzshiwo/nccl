@@ -334,6 +334,7 @@ inspectorResult_t inspectorCollTimeoutDump(
   if (!jfo || timeoutRecords.empty()) return inspectorSuccess;
   inspectorResult_t res = inspectorSuccess;
   bool locked = false;
+  const char* jobId = getenv("JOB_ID");
   JSON_CHK_GOTO(jsonLockOutput(jfo), res, exit);
   locked = true;
   for (const inspectorCollTimeoutInfo& timeout : timeoutRecords) {
@@ -357,6 +358,8 @@ inspectorResult_t inspectorCollTimeoutDump(
     JSON_CHK_GOTO(jsonStartObject(jfo), res, exit);
     JSON_CHK_GOTO(jsonKey(jfo, "event_type"), res, exit);
     JSON_CHK_GOTO(jsonStr(jfo, inspectorCollTimeoutEventType(timeout.reason)), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "job_id"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, jobId && jobId[0] ? jobId : "unknown"), res, exit);
     JSON_CHK_GOTO(jsonKey(jfo, "dump_timestamp_us"), res, exit);
     JSON_CHK_GOTO(jsonUint64(jfo, timeout.dumpTimestampUsec), res, exit);
     char hostname[256] = {};
