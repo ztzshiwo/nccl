@@ -335,6 +335,7 @@ inspectorResult_t inspectorCollTimeoutDump(
   inspectorResult_t res = inspectorSuccess;
   bool locked = false;
   const char* jobId = getenv("JOB_ID");
+  const char* retryCount = getenv("RETRY_COUNT");
   JSON_CHK_GOTO(jsonLockOutput(jfo), res, exit);
   locked = true;
   for (const inspectorCollTimeoutInfo& timeout : timeoutRecords) {
@@ -360,6 +361,8 @@ inspectorResult_t inspectorCollTimeoutDump(
     JSON_CHK_GOTO(jsonStr(jfo, inspectorCollTimeoutEventType(timeout.reason)), res, exit);
     JSON_CHK_GOTO(jsonKey(jfo, "job_id"), res, exit);
     JSON_CHK_GOTO(jsonStr(jfo, jobId && jobId[0] ? jobId : "unknown"), res, exit);
+    JSON_CHK_GOTO(jsonKey(jfo, "retry_count"), res, exit);
+    JSON_CHK_GOTO(jsonStr(jfo, retryCount && retryCount[0] ? retryCount : "unknown"), res, exit);
     JSON_CHK_GOTO(jsonKey(jfo, "dump_timestamp_us"), res, exit);
     JSON_CHK_GOTO(jsonUint64(jfo, timeout.dumpTimestampUsec), res, exit);
     char hostname[256] = {};
