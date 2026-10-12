@@ -283,6 +283,22 @@ static void cpuCosts() {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 3 && strcmp(argv[1], "--timeout-path") == 0) {
+    logFn = logger;
+    ncclInspectorCollTimeoutPath = inspectorTimeoutJobDir(argv[2]);
+    if (!ncclInspectorCollTimeoutPath) return 2;
+    ncclInspectorCollTimeoutOutputEnabled = true;
+    {
+      inspectorDumpThread dumper(nullptr, -1);
+      assert(dumper.inspectorTimeoutDump({}) == inspectorSuccess);
+      assert(!dumper.timeoutJfo); // No file until the first timeout.
+      inspectorCollTimeoutInfo timeout = {};
+      assert(dumper.inspectorTimeoutDump({timeout}) == inspectorSuccess);
+    }
+    free(ncclInspectorCollTimeoutPath);
+    ncclInspectorCollTimeoutPath = nullptr;
+    return 0;
+  }
   assert(argc == 2);
   assert(jsonInitFileOutput(&regressionJson, argv[1]) == jsonSuccess);
   logFn = logger; ncclInspectorDumpMinSizeBytes = 0; requireKernelTiming = false;

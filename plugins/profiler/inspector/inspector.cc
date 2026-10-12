@@ -492,14 +492,14 @@ inspectorResult_t inspectorCommInfoListFinalize(struct inspectorCommInfoList* co
  *   bool - true if directory exists and is writable, false otherwise.
  *
  */
-static bool ensureDir(char* workdir) {
+static bool ensureDir(const char* workdir) {
   struct stat st;
 
   // Check if directory exists
   if (stat(workdir, &st) == 0) {
     if (S_ISDIR(st.st_mode)) {
       // Directory exists, check if it's writable
-      if (access(workdir, W_OK) == 0) {
+      if (access(workdir, W_OK | X_OK) == 0) {
         return true; // Directory exists and is writable
       } else {
         INFO_INSPECTOR(
@@ -520,6 +520,9 @@ static bool ensureDir(char* workdir) {
     const mode_t mode = 0777;
     if (mkdir(workdir, mode) == 0) {
       return true; // Directory created successfully
+    } else if (errno == EEXIST && stat(workdir, &st) == 0 &&
+               S_ISDIR(st.st_mode) && access(workdir, W_OK | X_OK) == 0) {
+      return true; // Another rank created the shared directory first.
     } else {
       INFO_INSPECTOR(
         "NCCL Inspector: failed to create dump directory %s: %s", workdir,
@@ -527,6 +530,30 @@ static bool ensureDir(char* workdir) {
       return false;
     }
   }
+}
+
+// Resolve and create <root>/<JOB_ID>/<RETRY_COUNT> at initialization.
+static char* inspectorTimeoutJobDir(const char* root) {
+  const char* names[] = {"JOB_ID", "RETRY_COUNT"};
+  const char* values[] = {getenv(names[0]), getenv(names[1])};
+  for (int i = 0; i < 2; ++i) {
+    if (!values[i] || !values[i][0]) values[i] = "unknown";
+    // Each value must identify one child, never an absolute or parent path.
+    if (strchr(values[i], '/') || strcmp(values[i], ".") == 0 || strcmp(values[i], "..") == 0) {
+      INFO_INSPECTOR("NCCL Inspector: invalid %s for timeout subdirectory", names[i]);
+      return nullptr;
+    }
+  }
+  char jobPath[2048], path[2048];
+  int jobLength = snprintf(jobPath, sizeof(jobPath), "%s/%s", root, values[0]);
+  int length = snprintf(path, sizeof(path), "%s/%s/%s", root, values[0], values[1]);
+  if (jobLength < 0 || static_cast<size_t>(jobLength) >= sizeof(jobPath) ||
+      length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+    INFO_INSPECTOR("NCCL Inspector: timeout directory path is too long");
+    return nullptr;
+  }
+  if (!ensureDir(root) || !ensureDir(jobPath) || !ensureDir(path)) return nullptr;
+  return strdup(path);
 }
 
 /*
@@ -764,8 +791,13 @@ inspectorResult_t inspectorDumpThread::inspectorTimeoutDump(
     char hostname[256] = {};
     gethostname(hostname, sizeof(hostname) - 1);
     char path[2048];
-    snprintf(path, sizeof(path), "%s/%s-pid%d.log",
-             timeoutOutputRoot, hostname, getpid());
+    int length = snprintf(path, sizeof(path), "%s/%s-pid%d.log",
+                          timeoutOutputRoot, hostname, getpid());
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+      INFO_INSPECTOR("NCCL Inspector: timeout log path is too long");
+      timeoutWriterFailed = true;
+      return inspectorFileOpenError;
+    }
     jsonResult_t result = jsonInitFileOutput(&timeoutJfo, path);
     if (result != jsonSuccess) {
       INFO_INSPECTOR("NCCL Inspector: cannot open timeout file %s: %s",
@@ -1212,8 +1244,8 @@ static inspectorResult_t initDumpThreadFromEnv() {
   const char* timeoutPath = getenv("NCCL_INSPECTOR_COLL_TIMEOUT_PATH");
   ncclInspectorCollTimeoutOutputEnabled = false;
   if (timeoutPath && timeoutPath[0] && ncclInspectorCollTimeoutUsecs > 0) {
-    ncclInspectorCollTimeoutPath = strdup(timeoutPath);
-    if (ncclInspectorCollTimeoutPath && ensureDir(ncclInspectorCollTimeoutPath)) {
+    ncclInspectorCollTimeoutPath = inspectorTimeoutJobDir(timeoutPath);
+    if (ncclInspectorCollTimeoutPath) {
       ncclInspectorCollTimeoutOutputEnabled = true;
     } else {
       INFO_INSPECTOR(
