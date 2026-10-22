@@ -1477,6 +1477,13 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->scanEnd = nullptr;
   commInfo->nextCollSequence = 0;
   commInfo->furthestStartedSequence = 0;
+  commInfo->nextPlanSequence = 0;
+  commInfo->furthestStartedPlan = 0;
+  memset(commInfo->channelStartedThrough, 0, sizeof(commInfo->channelStartedThrough));
+  memset(commInfo->channelCompletedThrough, 0, sizeof(commInfo->channelCompletedThrough));
+  commInfo->observedChannels = 0;
+  commInfo->impliedCompleteRetired = 0;
+  commInfo->provenChannelEvents = 0;
   commInfo->collHandlesClosing = false;
   commInfo->collHandleObjects = 0;
   commInfo->p2pSeqNum = 0;
@@ -1681,7 +1688,15 @@ inspectorResult_t inspectorDelComm(struct inspectorCommInfo *commInfo) {
   inspectorLockWr(&commInfoPtr->guard);
   commInfoPtr->dump_coll = false;
   commInfoPtr->dump_p2p = false;
+  uint64_t impliedRetired = commInfoPtr->impliedCompleteRetired;
+  uint64_t provenEvents = commInfoPtr->provenChannelEvents;
   inspectorUnlockRWLock(&commInfoPtr->guard);
+  if (impliedRetired || provenEvents) {
+    INFO_INSPECTOR("NCCL Inspector: comm %s rank %d: %llu timed-out collectives retired as "
+                   "proven complete by later progress, %llu lost channel events proven",
+                   commInfoPtr->commHashStr, commInfoPtr->rank,
+                   (unsigned long long)impliedRetired, (unsigned long long)provenEvents);
+  }
 
   INSPECTOR_LOCK_WR_FLAG(&deletedCommInfoList->guard, locked,
                          "inspectorDelComm: deletedCommInfoList::guard -wr");
@@ -1909,6 +1924,67 @@ static inspectorCollTimeoutReason_t inspectorClassifyCollTimeout(
   return inspectorCollTimeoutUnknown;
 }
 
+// Channels that belong to coll under every placement consistent with what was
+// observed: NCCL gives a collective one contiguous range of nChannels channels.
+static uint64_t inspectorCertainCollChannels(const inspectorCollInfo* coll,
+                                             uint32_t commChannels) {
+  int n = int(coll->nChannels);
+  int channels = int(commChannels);
+  if (n <= 0 || n > channels || channels > MAX_CHANNELS) return 0;
+  int loMin = 0;
+  int loMax = channels - n;
+  uint64_t seen = coll->startedChannelMask | coll->completedChannelMask;
+  if (seen) {
+    int minSeen = __builtin_ctzll(seen);
+    int maxSeen = 63 - __builtin_clzll(seen);
+    if (maxSeen - minSeen + 1 > n) return 0;
+    if (maxSeen - n + 1 > loMin) loMin = maxSeen - n + 1;
+    if (minSeen < loMax) loMax = minSeen;
+  }
+  int first = loMax;
+  int last = loMin + n - 1;
+  if (first > last) return 0;
+  uint64_t throughLast = last == 63 ? ~0ULL : (1ULL << (last + 1)) - 1;
+  return throughLast & ~((1ULL << first) - 1);
+}
+
+struct inspectorCollProof {
+  uint64_t started;   // channels proven started without an observed start
+  uint64_t completed; // channels proven completed without an observed stop
+  bool done;          // every channel of the collective is proven complete
+};
+
+// Caller holds comm->guard and coll->guard. A started channel in a later plan
+// proves the whole earlier kernel finished. Within a plan, a later collective
+// starting (completing) on channel c proves this one started (completed) on c.
+static inspectorCollProof inspectorProveCollProgress(inspectorCommInfo* comm,
+                                                     const inspectorCollInfo* coll) {
+  inspectorCollProof proof = {};
+  if (coll->planSequence &&
+      coll->planSequence < __atomic_load_n(&comm->furthestStartedPlan, __ATOMIC_ACQUIRE)) {
+    proof.done = true;
+    return proof;
+  }
+  if (!coll->trackingSequence) return proof;
+  uint64_t certain = inspectorCertainCollChannels(
+    coll, __atomic_load_n(&comm->observedChannels, __ATOMIC_ACQUIRE));
+  for (uint64_t open = certain & ~coll->completedChannelMask; open; open &= open - 1) {
+    int channel = __builtin_ctzll(open);
+    uint64_t bit = 1ULL << channel;
+    if (__atomic_load_n(&comm->channelCompletedThrough[channel], __ATOMIC_ACQUIRE) >
+        coll->trackingSequence) {
+      proof.completed |= bit;
+    } else if (!(coll->startedChannelMask & bit) &&
+               __atomic_load_n(&comm->channelStartedThrough[channel], __ATOMIC_ACQUIRE) >
+                 coll->trackingSequence) {
+      proof.started |= bit;
+    }
+  }
+  proof.done = unsigned(__builtin_popcountll(coll->completedChannelMask | proof.completed)) >=
+               coll->nChannels;
+  return proof;
+}
+
 static inspectorResult_t inspectorCollectTimedOutColls(
     std::vector<inspectorCollTimeoutInfo>& timeoutRecords) {
   timeoutRecords.clear();
@@ -1959,14 +2035,28 @@ static inspectorResult_t inspectorCollectTimedOutColls(
                                now - coll->executionStartUsec >= ncclInspectorCollTimeoutUsecs &&
                                !(coll->timeoutReportedMask &
                                  INSPECTOR_COLL_TIMEOUT_REPORTED_EXECUTION);
-      if (queueTimedOut || executionTimedOut) {
-        bool missingOne = coll->nChannels >= 1 &&
-            coll->nKernelChStarted == coll->nChannels - 1 &&
-            coll->nKernelChCompleted == coll->nKernelChStarted &&
-            coll->startedChannelMask == coll->completedChannelMask &&
+      bool timedOut = queueTimedOut || executionTimedOut;
+      // Already-reported records are rechecked so later progress can retire them.
+      if (!completed && (timedOut || coll->timeoutReportedMask)) {
+        inspectorCollProof proof = inspectorProveCollProgress(comm, coll);
+        uint64_t startedMask = coll->startedChannelMask | proof.started | proof.completed;
+        uint64_t completedMask = coll->completedChannelMask | proof.completed;
+        unsigned startedCount = __builtin_popcountll(startedMask);
+        unsigned completedCount = __builtin_popcountll(completedMask);
+        bool missingOne = timedOut && coll->nChannels >= 1 &&
+            startedCount == coll->nChannels - 1 &&
+            completedCount == startedCount &&
+            startedMask == completedMask &&
             unsigned(__builtin_popcountll(coll->startedChannelMask)) == coll->nKernelChStarted &&
             unsigned(__builtin_popcountll(coll->completedChannelMask)) == coll->nKernelChCompleted;
-        if (missingOne) {
+        if (proof.done) {
+          ++comm->impliedCompleteRetired;
+          comm->provenChannelEvents +=
+            coll->nChannels - unsigned(__builtin_popcountll(coll->completedChannelMask));
+        } else if (timedOut) {
+          comm->provenChannelEvents += __builtin_popcountll(proof.started | proof.completed);
+        }
+        if (proof.done || missingOne) {
           // Allocate the deferred erase entry before unlinking. Registry owners
           // are released only after dropping communicator/collective locks.
           try { retiredHandles.push_back(coll->handleId); }
@@ -1979,6 +2069,11 @@ static inspectorResult_t inspectorCollectTimedOutColls(
           inspectorUnlinkActiveCollLocked(comm, coll);
           inspectorUnlockRWLock(&coll->guard);
           inspectorArmActiveHeadLocked(comm, now);
+          coll = next;
+          continue;
+        }
+        if (!timedOut) {
+          inspectorUnlockRWLock(&coll->guard);
           coll = next;
           continue;
         }
@@ -2025,16 +2120,13 @@ static inspectorResult_t inspectorCollectTimedOutColls(
             (timeout.msgSizeBytes % timeout.expectedChannels != 0);
         }
 
-        timeout.startedChannelMask = coll->startedChannelMask;
-        timeout.completedChannelMask = coll->completedChannelMask;
-        timeout.startedChannels = __builtin_popcountll(timeout.startedChannelMask);
-        timeout.completedChannels = __builtin_popcountll(timeout.completedChannelMask);
-        timeout.reason = queueTimedOut
-                           ? inspectorCollTimeoutOperationNotDispatched
-                           : inspectorClassifyCollTimeout(
-                               timeout.expectedChannels,
-                               timeout.startedChannels,
-                               timeout.completedChannels);
+        timeout.startedChannelMask = startedMask;
+        timeout.completedChannelMask = completedMask;
+        timeout.startedChannels = startedCount;
+        timeout.completedChannels = completedCount;
+        timeout.reason = inspectorClassifyCollTimeout(timeout.expectedChannels,
+                                                      timeout.startedChannels,
+                                                      timeout.completedChannels);
         timeout.hasValidChannelTiming = calculateKernelExecTimeStats(
           coll, &timeout.timingSource,
           &timeout.minExecTimeUsecs, &timeout.minChannel,

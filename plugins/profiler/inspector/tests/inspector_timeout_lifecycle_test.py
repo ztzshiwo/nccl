@@ -42,15 +42,29 @@ def main():
     subprocess.run([str(out/'lifecycle-test'), str(output)], check=True, timeout=120)
     records = [json.loads(line) for line in output.read_text().splitlines()]
     timeouts = [r for r in records if 'coll_timeout' in r]
-    assert len(timeouts) == 4
+    assert len(timeouts) == 5
     assert [r['metadata']['event_type'] for r in timeouts] == [
         'collective_timeout_gpu_issue', 'collective_timeout_communication_issue',
-        'collective_timeout_gpu_and_communication_issue', 'collective_timeout_gpu_issue']
+        'collective_timeout_gpu_and_communication_issue', 'collective_timeout_gpu_issue',
+        'collective_timeout_communication_issue']
     assert all(set(r) == {'header', 'metadata', 'coll_timeout'} for r in timeouts)
+    # Channels proven by later progress are folded into the r6 fields; no keys are added.
+    assert all(set(r['header']) == {'id', 'comm_name', 'rank', 'n_ranks', 'nnodes'} for r in timeouts)
+    assert all(set(r['metadata']) == {'event_type', 'job_id', 'retry_count', 'dump_timestamp_us',
+                                      'hostname', 'pid'} for r in timeouts)
+    assert all(set(r['coll_timeout']) == {
+        'coll', 'coll_seq_number', 'algo', 'proto', 'coll_msg_size_bytes', 'timeout_elapsed_ms',
+        'queue_wait_elapsed_ms', 'kernel_execution_elapsed_ms', 'expected_channels',
+        'estimated_channel_payload_bytes', 'started_channels', 'completed_channels',
+        'started_channel_mask', 'completed_channel_mask', 'min_exec_time_us', 'min_channel',
+        'max_exec_time_us', 'max_channel', 'timing_source'} for r in timeouts)
+    folded = timeouts[-1]['coll_timeout']
+    assert (folded['expected_channels'], folded['started_channels'], folded['completed_channels'],
+            folded['started_channel_mask'], folded['completed_channel_mask']) == (4, 4, 3, 15, 7)
     assert all('proxy' not in r for r in records)
     assert len([r for r in records if 'coll_perf' in r]) == 3
     assert len([r for r in records if 'p2p_perf' in r]) == 1
-    print('PASS historical JSON schema, normal collective/P2P output, non-exempt timeout output')
+    print('PASS historical JSON schema, normal collective/P2P output, non-exempt and folded timeout output')
 
     # Keep filesystem fixtures under the build directory, isolated across runs.
     paths = Path(tempfile.mkdtemp(prefix='job-paths-', dir=out))

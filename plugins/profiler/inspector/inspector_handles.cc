@@ -15,6 +15,8 @@ namespace {
 // Low byte: tag bit + 7-bit kind; upper bits: never-reused collective ID.
 // No token is dereferenced, including when the registry no longer contains it.
 constexpr unsigned TOKEN_SHIFT = 8;
+constexpr unsigned PLAN_TOKEN_KIND = 127;
+static_assert(PLAN_TOKEN_KIND > MAX_CHANNELS, "plan tokens must never resolve to a collective");
 static_assert(sizeof(uintptr_t) == 8, "Inspector tokens require a 64-bit host");
 static_assert(alignof(inspectorP2pInfo) >= 2 && alignof(inspectorKernelChInfo) >= 2,
               "P2P pointers must not have the collective token tag");
@@ -118,10 +120,36 @@ void inspectorCloseCollHandles(inspectorCommInfo* comm) {
   collHandleRegistryChanged.wait(lock, [&] { return comm->collHandleObjects == 0; });
 }
 
-void inspectorMarkCollStarted(inspectorCollInfo* coll) {
-  auto* sequence = &coll->commInfo->furthestStartedSequence;
-  uint64_t old = __atomic_load_n(sequence, __ATOMIC_RELAXED);
-  while (old < coll->trackingSequence &&
-         !__atomic_compare_exchange_n(sequence, &old, coll->trackingSequence,
+template <typename T>
+static void inspectorAtomicMax(T* target, T value) {
+  T old = __atomic_load_n(target, __ATOMIC_RELAXED);
+  while (old < value &&
+         !__atomic_compare_exchange_n(target, &old, value,
                                       false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+}
+
+void inspectorMarkCollStarted(inspectorCollInfo* coll) {
+  inspectorAtomicMax(&coll->commInfo->furthestStartedSequence, coll->trackingSequence);
+}
+
+void* inspectorPlanToken(uint64_t planSequence) {
+  return reinterpret_cast<void*>((uintptr_t(planSequence) << TOKEN_SHIFT) |
+                                 (uintptr_t(PLAN_TOKEN_KIND) << 1) | 1);
+}
+bool inspectorIsPlanToken(void* handle) {
+  return inspectorIsCollToken(handle) && inspectorCollTokenKind(handle) == PLAN_TOKEN_KIND;
+}
+uint64_t inspectorPlanTokenSequence(void* handle) { return uintptr_t(handle) >> TOKEN_SHIFT; }
+
+void inspectorMarkChannelStarted(inspectorCollInfo* coll, unsigned channelId) {
+  auto* comm = coll->commInfo;
+  inspectorAtomicMax(&comm->observedChannels, uint32_t(channelId + 1));
+  if (!coll->trackingSequence) return;
+  inspectorAtomicMax(&comm->channelStartedThrough[channelId], coll->trackingSequence);
+  if (coll->planSequence) inspectorAtomicMax(&comm->furthestStartedPlan, coll->planSequence);
+}
+
+void inspectorMarkChannelCompleted(inspectorCollInfo* coll, unsigned channelId) {
+  if (!coll->trackingSequence) return;
+  inspectorAtomicMax(&coll->commInfo->channelCompletedThrough[channelId], coll->trackingSequence);
 }

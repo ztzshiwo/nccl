@@ -50,10 +50,17 @@ struct Fixture {
     assert(inspectorCommInfoListFinalize(&g_state.deletedComms) == inspectorSuccess);
     assert(poolCount() == 0);
   }
-  void* coll(int channels, const char* func = "AllReduce") {
+  void* group() {
+    ncclProfilerEventDescr_t d = {};
+    d.type = ncclProfileGroup;
+    void* h = nullptr;
+    assert(ncclProfiler_v5.startEvent(comm, &h, &d) == ncclSuccess);
+    return h;
+  }
+  void* coll(int channels, const char* func = "AllReduce", void* plan = nullptr) {
     ncclProfilerEventDescr_t d = {};
     d.type = ncclProfileColl; d.coll.func = func; d.coll.datatype = "ncclFloat32";
-    d.coll.count = 32768; d.coll.nChannels = channels;
+    d.coll.count = 32768; d.coll.nChannels = channels; d.coll.parentGroup = plan;
     d.coll.algo = "RING"; d.coll.proto = "SIMPLE";
     void* h = nullptr;
     assert(ncclProfiler_v5.startEvent(comm, &h, &d) == ncclSuccess);
@@ -192,6 +199,100 @@ static void nonExemptAndCallbacks() {
   assert(inspectorCommInfoListDump(regressionJson, &g_state.liveComms) == inspectorSuccess);
 }
 
+// NCCL 2.30.7 can drop KernelCh events for batch items after the first. Later
+// progress on the same communicator proves those channels ran.
+static void impliedCompletion() {
+  {  // A started channel in a later plan proves the earlier kernel finished.
+    Fixture f;
+    auto g1 = f.group();
+    assert(g1 && inspectorIsPlanToken(g1) && !inspectorAcquireCollHandle(g1));
+    auto x = f.coll(4, "AllReduce", g1); f.stop(g1);
+    f.complete(f.start(x, 0)); f.complete(f.start(x, 1)); f.stop(x);
+    auto g2 = f.group(); auto y = f.coll(4, "AllReduce", g2); f.stop(g2);
+    for (int c = 0; c < 4; ++c) f.complete(f.start(y, c));
+    f.stop(y);
+    auto xo = inspectorAcquireCollHandle(x);
+    assert(xo->planSequence == 1);
+    now(31000000); assert(f.scan().empty()); assert(xo->retired);
+    assert(f.comm->impliedCompleteRetired == 1 && f.comm->provenChannelEvents == 2);
+    assert(!f.start(x, 2)); // late callbacks for retired collectives stay harmless
+    xo.reset(); assert(poolCount() == 0 && !f.comm->activeHead);
+  }
+  {  // Same plan: a later collective completing on the missing channels.
+    Fixture f;
+    auto g = f.group(); auto x = f.coll(4, "AllReduce", g); auto y = f.coll(4, "AllGather", g);
+    f.stop(g);
+    f.complete(f.start(x, 0)); f.complete(f.start(x, 1));
+    for (int c = 0; c < 4; ++c) f.complete(f.start(y, c));
+    f.stop(x); f.stop(y);
+    auto xo = inspectorAcquireCollHandle(x);
+    now(31000000); assert(f.scan().empty()); assert(xo->retired);
+    assert(f.comm->impliedCompleteRetired == 1 && f.comm->provenChannelEvents == 2);
+  }
+  {  // Same plan, no observed channel at all: the queue timeout is proven complete too.
+    Fixture f;
+    auto g = f.group(); auto x = f.coll(2, "AllReduce", g); auto y = f.coll(2, "AllGather", g);
+    f.stop(g);
+    f.complete(f.start(y, 0)); f.complete(f.start(y, 1)); f.stop(x); f.stop(y);
+    auto xo = inspectorAcquireCollHandle(x);
+    now(31000000); assert(f.scan().empty()); assert(xo->retired);
+    assert(f.comm->impliedCompleteRetired == 1 && f.comm->provenChannelEvents == 2);
+  }
+  {  // Partial proof is folded into the existing fields before classification.
+    Fixture f;
+    auto g = f.group(); auto x = f.coll(4, "AllReduce", g); auto y = f.coll(4, "AllGather", g);
+    f.stop(g);
+    f.complete(f.start(x, 0)); f.complete(f.start(x, 1));
+    f.complete(f.start(y, 2)); f.start(y, 3);
+    f.stop(x); f.stop(y);
+    now(31000000); auto out = f.scan();
+    assert(out.size() == 2);
+    assert(out[0].startedChannelMask == 0xf && out[0].completedChannelMask == 0x7);
+    assert(out[0].startedChannels == 4 && out[0].completedChannels == 3);
+    assert(out[0].reason == inspectorCollTimeoutCommunicationIssue);
+    assert(out[1].startedChannelMask == 0xc && out[1].completedChannelMask == 0x4);
+    assert(out[1].reason == inspectorCollTimeoutGpuAndCommunicationIssue);
+    assert(f.comm->provenChannelEvents == 2 && f.comm->impliedCompleteRetired == 0);
+    assert(inspectorCollTimeoutDump(regressionJson, {out[0]}) == inspectorSuccess);
+    assert(f.scan().empty());
+  }
+  {  // Fewer channels than the communicator: only certainly-owned channels count.
+    Fixture f;
+    auto g0 = f.group(); auto z = f.coll(1, "AllReduce", g0); f.stop(g0);
+    f.complete(f.start(z, 7)); f.stop(z);
+    auto g1 = f.group(); auto x = f.coll(4, "AllReduce", g1); auto y = f.coll(4, "AllGather", g1);
+    f.stop(g1);
+    f.complete(f.start(x, 2));
+    for (int c = 2; c < 6; ++c) f.complete(f.start(y, c));
+    f.stop(x); f.stop(y);
+    now(31000000); auto out = f.scan();
+    assert(out.size() == 1);
+    assert(out[0].startedChannelMask == 0xc && out[0].completedChannelMask == 0xc);
+    assert(out[0].reason == inspectorCollTimeoutGpuIssue);
+  }
+  {  // A record reported before the proof arrives is retired once it does.
+    Fixture f;
+    auto g1 = f.group(); auto x = f.coll(4, "AllReduce", g1); f.stop(g1);
+    f.complete(f.start(x, 0)); f.complete(f.start(x, 1)); f.stop(x);
+    now(31000000); auto out = f.scan();
+    assert(out.size() == 1 && out[0].reason == inspectorCollTimeoutGpuIssue);
+    auto xo = inspectorAcquireCollHandle(x);
+    auto g2 = f.group(); auto y = f.coll(1, "AllReduce", g2); f.stop(g2);
+    auto ych = f.start(y, 0);
+    assert(f.scan().empty()); assert(xo->retired);
+    assert(f.comm->impliedCompleteRetired == 1 && f.comm->provenChannelEvents == 2);
+    f.complete(ych); f.stop(y);
+  }
+  {  // Plan tokens are inert in every callback, and absent when timeouts are off.
+    Fixture f;
+    auto g = f.group();
+    f.stop(g); f.record(g);
+    ncclInspectorCollTimeoutOutputEnabled = false;
+    assert(!f.group());
+    ncclInspectorCollTimeoutOutputEnabled = true;
+  }
+}
+
 static void finalizeWaitsForLease() {
   Fixture f;
   auto h = f.coll(2); f.complete(f.start(h, 0)); f.start(h, 1);
@@ -274,9 +375,28 @@ static void cpuCosts() {
   for (int i = 0; i < 100; ++i) assert(f.scan().empty());
   auto scanEnd = std::chrono::steady_clock::now();
   assert(inspectorTestScanVisits - visits == 100 && baselineVisits == 409600);
+  auto watermarkStart = std::chrono::steady_clock::now();
+  inspectorLockWr(&owner->guard);
+  for (int i = 0; i < 100000; ++i) {
+    inspectorMarkChannelStarted(owner.get(), i & 63);
+    inspectorMarkChannelCompleted(owner.get(), i & 63);
+  }
+  inspectorUnlockRWLock(&owner->guard);
+  auto watermarkEnd = std::chrono::steady_clock::now();
+  owner.reset();
+  // Full KernelCh start + record + stop callbacks, two channels per collective.
+  auto eventsStart = std::chrono::steady_clock::now();
+  for (auto* h : handles) {
+    f.complete(f.start(h, 0)); f.complete(f.start(h, 1)); f.stop(h);
+  }
+  auto eventsEnd = std::chrono::steady_clock::now();
+  assert(!f.comm->activeHead);
   auto ns = [](auto d) { return std::chrono::duration<double, std::nano>(d).count() / 100000; };
   std::cout << "CPU baseline_object_lock_ns=" << ns(middle-start)
             << " registry_lease_plus_lock_ns=" << ns(end-middle)
+            << " channel_watermark_pair_ns=" << ns(watermarkEnd-watermarkStart)
+            << " kernelch_callbacks_per_channel_ns="
+            << std::chrono::duration<double, std::nano>(eventsEnd-eventsStart).count() / (2 * handles.size())
             << " scan_visits_per_pass=1 pending_records=4096"
             << " full_list_lock_walk_us=" << std::chrono::duration<double, std::micro>(scanMiddle-scanStart).count()/100
             << " window_scan_us=" << std::chrono::duration<double, std::micro>(scanEnd-scanMiddle).count()/100 << "\n";
@@ -304,10 +424,11 @@ int main(int argc, char** argv) {
   logFn = logger; ncclInspectorDumpMinSizeBytes = 0; requireKernelTiming = false;
   assert(inspectorGlobalStateInit() == inspectorSuccess);
   assert(inspectorEventPoolInit(16, 16, 1) == inspectorSuccess);
-  thresholdsAndReuse(); frontierAndGaps(); nonExemptAndCallbacks();
+  thresholdsAndReuse(); frontierAndGaps(); nonExemptAndCallbacks(); impliedCompletion();
   finalizeWaitsForLease(); callbackRaces(); concurrentProducers(); cpuCosts();
   assert(inspectorEventPoolFinalize() == inspectorSuccess);
   assert(jsonFinalizeFileOutput(regressionJson) == jsonSuccess);
   inspectorLockDestroy(&g_state.liveComms.guard); inspectorLockDestroy(&g_state.deletedComms.guard);
-  std::cout << "PASS threshold, discard, frontier, gaps, reuse, late callbacks, P2P, finalize, races\n";
+  std::cout << "PASS threshold, discard, frontier, gaps, reuse, late callbacks, P2P, "
+               "implied completion, finalize, races\n";
 }

@@ -207,6 +207,16 @@ struct inspectorCommInfo {
   struct inspectorCollInfo* scanEnd; // first live node outside the scan window
   uint64_t nextCollSequence;         // protected by guard, across all coll types
   uint64_t furthestStartedSequence;  // atomic builtins; survives completed nodes
+  // Progress watermarks, all atomic builtins. Kernels of one communicator run
+  // in launch order and each channel runs its work in submission order, so a
+  // later collective's progress proves earlier progress whose events were lost.
+  uint64_t nextPlanSequence;         // one per Group (kernel launch) event
+  uint64_t furthestStartedPlan;      // highest plan with a started channel
+  uint64_t channelStartedThrough[MAX_CHANNELS];   // highest trackingSequence
+  uint64_t channelCompletedThrough[MAX_CHANNELS]; // highest trackingSequence
+  uint32_t observedChannels;         // highest observed channelId + 1
+  uint64_t impliedCompleteRetired;   // protected by guard
+  uint64_t provenChannelEvents;      // protected by guard
   bool collHandlesClosing;          // protected by the handle registry mutex
   size_t collHandleObjects;         // includes callbacks in flight
   uint64_t p2pSeqNum;
@@ -332,6 +342,7 @@ struct inspectorCollInfo {
   bool parentStopped;
   uintptr_t handleId;
   uint64_t trackingSequence;
+  uint64_t planSequence; // 0 when NCCL supplied no Inspector Group token
   struct inspectorCollInfo* activePrev;
   struct inspectorCollInfo* activeNext;
   pthread_rwlock_t guard;
@@ -445,6 +456,14 @@ void inspectorMaybeReleaseCollHandle(const std::shared_ptr<inspectorCollInfo>& c
 void inspectorBeginCloseCollHandles(inspectorCommInfo* comm);
 void inspectorCloseCollHandles(inspectorCommInfo* comm);
 void inspectorMarkCollStarted(inspectorCollInfo* coll);
+// Group events return an unallocated token carrying the communicator-local
+// plan sequence; it uses a reserved collective token kind above MAX_CHANNELS.
+void* inspectorPlanToken(uint64_t planSequence);
+bool inspectorIsPlanToken(void* handle);
+uint64_t inspectorPlanTokenSequence(void* handle);
+// Caller holds coll->guard.
+void inspectorMarkChannelStarted(inspectorCollInfo* coll, unsigned channelId);
+void inspectorMarkChannelCompleted(inspectorCollInfo* coll, unsigned channelId);
 inspectorResult_t inspectorGetTimeUTC(char* buffer, size_t bufferSize);
 inspectorResult_t inspectorAddComm(struct inspectorCommInfo **commInfo,
                                    const char* commName, uint64_t commHash,

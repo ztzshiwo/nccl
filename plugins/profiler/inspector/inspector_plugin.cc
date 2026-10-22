@@ -259,6 +259,8 @@ static std::shared_ptr<inspectorCollInfo> inspectorPluginCollInfoInit(struct ins
   collInfoPtr->algo = eDescr->coll.algo;
   collInfoPtr->proto = eDescr->coll.proto;
   collInfoPtr->sn = eDescr->coll.seqNumber;
+  collInfoPtr->planSequence = inspectorIsPlanToken(eDescr->coll.parentGroup)
+                                ? inspectorPlanTokenSequence(eDescr->coll.parentGroup) : 0;
   collInfoPtr->nChannels = eDescr->coll.nChannels;
   if (collInfoPtr->nChannels > 0) {
     inspectorPluginCollInfoRef(collInfoPtr); //extra ref for kernel completion
@@ -401,6 +403,7 @@ static void inspectorPluginKernelChInfoInitColl(struct inspectorKernelChInfo **k
   }
   collInfo->nKernelChStarted += 1;
   collInfo->startedChannelMask |= 1ULL << eDescr->kernelCh.channelId;
+  inspectorMarkChannelStarted(collInfo, eDescr->kernelCh.channelId);
   inspectorPluginCollInfoRef(collInfo); //Pairs with Stop Kernel Event
 
   *kernelChInfo = kernelChInfoPtr;
@@ -528,7 +531,13 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     return ncclSuccess;
   }
   *eHandle = nullptr;
-  if (eDescr->type == ncclProfileColl) {
+  if (eDescr->type == ncclProfileGroup) {
+    // A non-null group handle also makes NCCL count graph-captured collectives
+    // in coll.seqNumber, so keep the null handle when timeouts are disabled.
+    if (!inspectorCollTimeoutEnabled()) return ncclSuccess;
+    auto* commInfo = (struct inspectorCommInfo*)context;
+    *eHandle = inspectorPlanToken(__atomic_add_fetch(&commInfo->nextPlanSequence, 1, __ATOMIC_RELAXED));
+  } else if (eDescr->type == ncclProfileColl) {
     if (!inspectorShouldTrackColl(eDescr)) return ncclSuccess;
     struct inspectorCollInfo *collEvent = nullptr;
     struct inspectorCommInfo *commInfoCtx = (struct inspectorCommInfo*)context;
@@ -603,6 +612,7 @@ static ncclResult_t inspectorPluginStopEventKernelChColl(struct inspectorKernelC
   kernelChInfo->tsCompletedUsec = inspectorGetTime();
   ++collInfo->nKernelChCompleted;
   collInfo->completedChannelMask |= bit;
+  inspectorMarkChannelCompleted(collInfo, kernelChInfo->channelId);
   inspectorPluginCollInfoDeRef(collInfo);
   if (collInfo->nKernelChCompleted == collInfo->nKernelChStarted &&
       collInfo->nKernelChCompleted == collInfo->nChannels) {
@@ -767,6 +777,7 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
     return ncclSuccess;
   }
 
+  if (inspectorIsPlanToken(eHandle)) return ncclSuccess;
   if (inspectorIsCollToken(eHandle)) {
     auto owner = inspectorAcquireCollHandle(eHandle);
     if (!owner) return ncclSuccess;
